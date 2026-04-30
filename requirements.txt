@@ -1,6 +1,7 @@
-# requirements.txt
-discord.py==2.3.2
-PyGithub==2.1.1
-aiohttp==3.9.1
-flask==3.0.0
-python-dotenv==1.0.0
+# requirements.txt - Updated for Python 3.13+
+discord.py>=2.4.0
+PyGithub>=2.3.0
+aiohttp>=3.9.0
+flask>=3.0.0
+python-dotenv>=1.0.0
+Pillow>=10.0.0
