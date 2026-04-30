@@ -1,8 +1,14 @@
+# main.py - with better error handling and logging
 import sys
 import os
+import traceback
 import warnings
 warnings.filterwarnings('ignore', category=SyntaxWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
+
+# Enable logging to see what's happening
+import logging
+logging.basicConfig(level=logging.INFO)
 
 import discord
 from discord.ext import commands
@@ -18,11 +24,23 @@ from enum import Enum
 import re
 from github import Github, Auth
 
+# Print startup info for debugging
+print("Starting bot initialization...")
+print(f"Python version: {sys.version}")
+
 # Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
-GITHUB_REPO = os.getenv('GITHUB_REPO')  # Format: "username/repo"
-GUILD_ID = os.getenv('GUILD_ID')  # Optional: restrict to specific server
+GITHUB_REPO = os.getenv('GITHUB_REPO')
+GUILD_ID = os.getenv('GUILD_ID')
+
+print(f"Discord token present: {bool(DISCORD_TOKEN)}")
+print(f"GitHub token present: {bool(GITHUB_TOKEN)}")
+print(f"GitHub repo: {GITHUB_REPO}")
+
+if not DISCORD_TOKEN:
+    print("ERROR: DISCORD_TOKEN environment variable is not set!")
+    sys.exit(1)
 
 # File paths in your repo
 STATUS_FILE = "status.txt"
@@ -39,55 +57,56 @@ class DiscordBot(commands.Bot):
         super().__init__(command_prefix='!', intents=intents)
     
     async def setup_hook(self):
-        # Sync commands to specific guild for immediate updates, or globally
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            print(f"Synced commands to guild {GUILD_ID}")
-        else:
-            await self.tree.sync()
-            print("Synced commands globally")
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+                print(f"Synced commands to guild {GUILD_ID}")
+            else:
+                await self.tree.sync()
+                print("Synced commands globally")
+        except Exception as e:
+            print(f"Error syncing commands: {e}")
     
     async def on_ready(self):
         print(f'{self.user} has connected to Discord!')
         print(f'Bot is in {len(self.guilds)} guilds')
-        # Set bot status
-        await self.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.watching,
-                name="GitHub repository"
-            )
-        )
 
 bot = DiscordBot()
 
 # GitHub client with new authentication
-if GITHUB_TOKEN:
-    auth = Auth.Token(GITHUB_TOKEN)
-    github_client = Github(auth=auth)
-    repo = github_client.get_repo(GITHUB_REPO)
-else:
+try:
+    if GITHUB_TOKEN and GITHUB_REPO:
+        auth = Auth.Token(GITHUB_TOKEN)
+        github_client = Github(auth=auth)
+        repo = github_client.get_repo(GITHUB_REPO)
+        print("GitHub client initialized successfully")
+    else:
+        github_client = None
+        repo = None
+        print("WARNING: GitHub token or repo not configured!")
+except Exception as e:
+    print(f"Error initializing GitHub client: {e}")
     github_client = None
     repo = None
-    print("WARNING: GitHub token not configured!")
 
 class ContentManager:
     """Manages all content types and their file operations"""
     
     def __init__(self):
-        self.active_sessions = {}  # channel_id: ContentSession
+        self.active_sessions = {}
     
     async def get_file_content(self, file_path: str) -> str:
         """Get file content from GitHub"""
         if not repo:
-            return "Error: GitHub not configured"
+            return "Error: GitHub not configured. Set GITHUB_TOKEN and GITHUB_REPO environment variables."
         try:
             contents = repo.get_contents(file_path)
             return base64.b64decode(contents.content).decode('utf-8')
         except Exception as e:
             print(f"Error fetching {file_path}: {e}")
-            return ""
+            return f"Error fetching file: {str(e)}"
     
     async def commit_changes(self, file_path: str, content: str, commit_message: str, author: str):
         """Commit changes to GitHub"""
@@ -132,7 +151,6 @@ class StatusManager(ContentManager):
                 i += 1
                 continue
                 
-            # Check if this is a date line
             date_match = re.match(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}$', line)
             if date_match:
                 if current_incident:
@@ -145,7 +163,6 @@ class StatusManager(ContentManager):
                 i += 1
                 continue
             
-            # Check for incident/maintenance header
             incident_match = re.match(r'^(INCIDENT|MAINTENANCE):\s+(.+)$', line)
             if incident_match and current_incident:
                 current_incident['type'] = incident_match.group(1)
@@ -153,21 +170,18 @@ class StatusManager(ContentManager):
                 i += 1
                 continue
             
-            # Check for severity
             severity_match = re.match(r'^SEVERITY:\s+(.+)$', line)
             if severity_match and current_incident:
                 current_incident['severity'] = severity_match.group(1)
                 i += 1
                 continue
             
-            # Check for components
             components_match = re.match(r'^COMPONENTS:\s+(.+)$', line)
             if components_match and current_incident:
                 current_incident['components'] = components_match.group(1)
                 i += 1
                 continue
             
-            # Check for updates
             update_match = re.match(r'^(\w{3}\s+\d{1,2},\s+\d{2}:\d{2})\s+-\s+(\w+)\s+-\s+(.+)$', line)
             if update_match and current_incident:
                 current_incident['updates'].append({
@@ -178,7 +192,6 @@ class StatusManager(ContentManager):
                 i += 1
                 continue
             
-            # Check for "No incidents reported"
             if line == "No incidents reported." and current_incident:
                 current_incident['no_incidents'] = True
                 i += 1
@@ -315,7 +328,7 @@ class ContentView(discord.ui.View):
     """Interactive view for content management"""
     
     def __init__(self, session: ContentSession, manager: ContentManager):
-        super().__init__(timeout=600)  # 10 minute timeout
+        super().__init__(timeout=600)
         self.session = session
         self.manager = manager
         self.add_buttons()
@@ -418,7 +431,6 @@ class UpdateModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         incidents = status_manager.parse_status(self.session.original_content)
         
-        # Find and update the incident
         for i, inc in enumerate(incidents):
             if inc['date'] == self.incident['date']:
                 if 'updates' not in inc:
@@ -513,7 +525,7 @@ class IncidentModal(discord.ui.Modal):
         
         self.title_input = discord.ui.TextInput(
             label="Title",
-            placeholder="Brief description of the incident",
+            placeholder="Brief description",
             default=existing.get('title', '') if existing else '',
             required=True
         )
@@ -527,7 +539,7 @@ class IncidentModal(discord.ui.Modal):
         
         self.components = discord.ui.TextInput(
             label="Components",
-            placeholder="Comma-separated components",
+            placeholder="Comma-separated",
             default=existing.get('components', '') if existing else '',
             required=True
         )
@@ -542,7 +554,6 @@ class IncidentModal(discord.ui.Modal):
         incidents = status_manager.parse_status(self.session.original_content)
         
         if self.existing:
-            # Update existing incident
             for i, inc in enumerate(incidents):
                 if inc['date'] == self.existing['date']:
                     incidents[i] = {
@@ -555,7 +566,6 @@ class IncidentModal(discord.ui.Modal):
                     }
                     break
         else:
-            # Add new incident
             incidents.insert(0, {
                 'date': self.date.value,
                 'type': self.type.value,
@@ -655,7 +665,7 @@ class VersionModal(discord.ui.Modal):
         
         self.entries = discord.ui.TextInput(
             label="Changelog Entries",
-            placeholder="FEATURE Added new feature\nFIX Fixed bug\nOne per line: TYPE Description",
+            placeholder="FEATURE Added new feature\nFIX Fixed bug",
             default='\n'.join([f"{e['type']} {e['description']}" for e in existing.get('entries', [])]) if existing else '',
             required=True,
             style=discord.TextStyle.paragraph
@@ -794,7 +804,7 @@ class MemberModal(discord.ui.Modal):
         
         self.about = discord.ui.TextInput(
             label="About",
-            placeholder="Brief description about the member",
+            placeholder="Brief description",
             default=existing.get('about', '') if existing else '',
             required=False,
             style=discord.TextStyle.paragraph
@@ -826,7 +836,6 @@ class MemberModal(discord.ui.Modal):
         }
         
         if self.existing:
-            # Preserve existing data not in the form
             member_data.update({k: v for k, v in self.existing.items() 
                               if k not in member_data})
             
@@ -875,7 +884,7 @@ class SaveButton(discord.ui.Button):
         if success:
             await interaction.followup.send("✅ Changes saved to GitHub!", ephemeral=True)
         else:
-            await interaction.followup.send("❌ Failed to save changes! Check bot logs.", ephemeral=True)
+            await interaction.followup.send("❌ Failed to save changes! Check if GitHub token has repo permissions.", ephemeral=True)
 
 class CancelButton(discord.ui.Button):
     def __init__(self):
@@ -901,7 +910,6 @@ async def update_display(message: discord.Message, session: ContentSession):
         color=discord.Color.blue()
     )
     
-    # Truncate content for display
     content = session.original_content[:1000]
     if len(session.original_content) > 1000:
         content += "\n... (truncated)"
@@ -931,16 +939,14 @@ def get_manager(content_type: ContentType) -> ContentManager:
 async def edit_content(interaction: discord.Interaction, content_type: app_commands.Choice[str]):
     """Start an editing session for website content"""
     
-    # Check permissions
     allowed_roles = ["Developer", "Admin", "Content Editor"]
     if not any(role.name in allowed_roles for role in interaction.user.roles):
         await interaction.response.send_message(
-            "You don't have permission to edit content! Required roles: Developer, Admin, or Content Editor",
+            "You don't have permission to edit content!",
             ephemeral=True
         )
         return
     
-    # Get current content from GitHub
     content_type_enum = ContentType(content_type.value)
     
     if content_type_enum == ContentType.STATUS:
@@ -955,10 +961,8 @@ async def edit_content(interaction: discord.Interaction, content_type: app_comma
     
     await interaction.response.defer()
     
-    # Fetch current content
     content = await manager.get_file_content(file_path)
     
-    # Create session
     session = ContentSession(
         content_type=content_type_enum,
         data=None,
@@ -968,14 +972,12 @@ async def edit_content(interaction: discord.Interaction, content_type: app_comma
         message=None
     )
     
-    # Send interactive message
     embed = discord.Embed(
         title=f"📝 Editing {content_type.name}",
         description="Use the buttons below to make changes. Click Save when done.",
         color=discord.Color.blue()
     )
     
-    # Truncate content for display
     display_content = content[:1000]
     if len(content) > 1000:
         display_content += "\n... (truncated)"
@@ -986,7 +988,6 @@ async def edit_content(interaction: discord.Interaction, content_type: app_comma
     view = ContentView(session, manager)
     await interaction.followup.send(embed=embed, view=view)
     
-    # Store message reference
     message = await interaction.original_response()
     session.message = message
 
@@ -1014,7 +1015,6 @@ async def view_content(interaction: discord.Interaction, content_type: app_comma
     
     content = await manager.get_file_content(file_path)
     
-    # Truncate if too long
     if len(content) > 1900:
         content = content[:1900] + "\n... (truncated)"
     
@@ -1053,22 +1053,49 @@ async def help_editor(interaction: discord.Interaction):
     
     embed.add_field(
         name="Editing Changelog",
-        value="• Add/Edit/Remove versions\n• Each version has entries with type (FEATURE/FIX/UX/PERF/etc)\n• Entries format: TYPE Description",
+        value="• Add/Edit/Remove versions\n• Each version has entries with type\n• Entries format: TYPE Description",
         inline=False
     )
     
     embed.add_field(
         name="Editing Team",
-        value="• Add/Edit/Remove team members\n• Each member has ID, name, handle, roles, about\n• Timeline and skills can be managed through bot",
+        value="• Add/Edit/Remove team members\n• Each member has ID, name, handle, roles, about",
         inline=False
     )
     
     embed.add_field(
-        name="Saving",
-        value="• Click 💾 Save to commit changes to GitHub\n• Changes are immediate on the website\n• Author is tracked in commit message",
+        name="Important",
+        value="• Click 💾 Save to commit changes to GitHub\n• Author is tracked in commit message\n• Set up GITHUB_TOKEN and GITHUB_REPO env vars",
         inline=False
     )
     
-    embed.set_footer(text="Only authorized roles can edit content")
-    
     await interaction.response.send_message(embed=embed)
+
+# Keep-alive web server
+from flask import Flask
+from threading import Thread
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Bot is online and running!"
+
+def run():
+    port = int(os.environ.get('PORT', 10000))  # Render's default port
+    print(f"Starting web server on port {port}")
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+if __name__ == "__main__":
+    print("Starting keep-alive server...")
+    keep_alive()
+    print("Starting Discord bot...")
+    try:
+        bot.run(DISCORD_TOKEN)
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        traceback.print_exc()
