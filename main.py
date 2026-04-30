@@ -287,7 +287,13 @@ def format_webhook_message(incident: Dict) -> str:
         status = u.get('status', '').upper()
         desc   = u.get('description', '')
         status_emoji = STATUS_EMOJIS.get(status, '⚪')
-        lines.append(f"[{ts}] — {status_emoji} **{status}**")
+        # If it's already a Discord timestamp keep it, otherwise wrap it
+        if not ts.startswith('<t:'):
+            try:
+                ts = f"<t:{int(datetime.strptime(ts, '%b %d, %H:%M').replace(year=datetime.now().year).timestamp())}:f>"
+            except Exception:
+                pass
+        lines.append(f"{ts} — {status_emoji} **{status}**")
         lines.append(f"> {desc}")
         for task in tasks:
             lines.append(f"> 📋 {task}")
@@ -661,7 +667,7 @@ class UpdateModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         incidents = parse_status(self.session.raw)
-        ts = datetime.now().strftime("%b %d, %H:%M")
+        ts = f"<t:{int(datetime.now().timestamp())}:f>"
 
         for inc in incidents:
             if inc.get('date') == self.incident['date'] and inc.get('title') == self.incident.get('title'):
@@ -816,6 +822,51 @@ class MemberModal(discord.ui.Modal):
         self.session.selected_index = None
         await interaction.response.edit_message(embed=build_embed(self.session), view=build_view(self.session))
 
+class ActionDropdown(discord.ui.Select):
+    def __init__(self, session: Session, actions: list[tuple[str, str]]):
+        self.session = session
+        options = [discord.SelectOption(label=label, value=value) for label, value in actions]
+        super().__init__(placeholder="Choose an action…", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        action = self.values[0]
+        if action == "add_incident":
+            await interaction.response.send_modal(IncidentModal(self.session))
+        elif action == "add_version":
+            await interaction.response.send_modal(VersionModal(self.session))
+        elif action == "add_member":
+            await interaction.response.send_modal(MemberModal(self.session))
+        elif action in ("edit", "delete", "add_update"):
+            view = discord.ui.View(timeout=60)
+            view.add_item(SelectItemDropdown(self.session, action))
+            await interaction.response.edit_message(view=view)
+        elif action == "save_status":
+            await interaction.response.defer()
+            ok = await commit_file(self.session.file_path, self.session.raw, "Update status", str(self.session.author))
+            if ok:
+                incidents = parse_status(self.session.raw)
+                await sync_webhooks(incidents, str(self.session.author))
+                embed = build_embed(self.session)
+                embed.color = 0x57F287
+                embed.set_footer(text="✅ Saved to GitHub & webhook updated!")
+                await interaction.edit_original_response(embed=embed, view=build_view(self.session))
+            else:
+                await interaction.followup.send("❌ Failed to save!", ephemeral=True)
+        elif action == "save":
+            await interaction.response.defer()
+            label = "changelog" if self.session.content_type == ContentType.CHANGELOG else "team"
+            ok = await commit_file(self.session.file_path, self.session.raw, f"Update {label}", str(self.session.author))
+            if ok:
+                embed = build_embed(self.session)
+                embed.color = 0x57F287
+                embed.set_footer(text="✅ Saved to GitHub!")
+                await interaction.edit_original_response(embed=embed, view=build_view(self.session))
+            else:
+                await interaction.followup.send("❌ Failed to save!", ephemeral=True)
+        elif action == "cancel":
+            sessions.pop(self.session.author.id, None)
+            await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
 # ─── Views ────────────────────────────────────────────────────────────────────
 def build_view(session: Session) -> discord.ui.View:
     if session.content_type == ContentType.STATUS:
@@ -829,6 +880,14 @@ class StatusView(discord.ui.View):
     def __init__(self, session: Session):
         super().__init__(timeout=600)
         self.session = session
+        self.add_item(ActionDropdown(session, [
+            ("➕ New Incident",  "add_incident"),
+            ("✏️ Edit Incident",  "edit"),
+            ("📝 Add Update",     "add_update"),
+            ("🗑️ Delete Incident","delete"),
+            ("💾 Save & Post",    "save_status"),
+            ("↩️ Cancel",         "cancel"),
+        ]))
 
     async def on_timeout(self):
         sessions.pop(self.session.author.id, None)
@@ -878,6 +937,13 @@ class ChangelogView(discord.ui.View):
     def __init__(self, session: Session):
         super().__init__(timeout=600)
         self.session = session
+        self.add_item(ActionDropdown(session, [
+            ("➕ New Version",   "add_version"),
+            ("✏️ Edit Version",  "edit"),
+            ("🗑️ Delete Version","delete"),
+            ("💾 Save",          "save"),
+            ("↩️ Cancel",        "cancel"),
+        ]))
 
     async def on_timeout(self):
         sessions.pop(self.session.author.id, None)
@@ -919,6 +985,13 @@ class TeamView(discord.ui.View):
     def __init__(self, session: Session):
         super().__init__(timeout=600)
         self.session = session
+        self.add_item(ActionDropdown(session, [
+            ("➕ Add Member",   "add_member"),
+            ("✏️ Edit Member",  "edit"),
+            ("🗑️ Remove Member","delete"),
+            ("💾 Save",         "save"),
+            ("↩️ Cancel",       "cancel"),
+        ]))
 
     async def on_timeout(self):
         sessions.pop(self.session.author.id, None)
@@ -957,10 +1030,10 @@ class TeamView(discord.ui.View):
         await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
 
 # ─── Slash Commands ───────────────────────────────────────────────────────────
-ALLOWED_ROLES = {"Developer", "Admin", "Content Editor"}
+ALLOWED_ROLE_ID = 1444271393570160680
 
 def has_permission(member: discord.Member) -> bool:
-    return any(role.name in ALLOWED_ROLES for role in member.roles)
+    return any(role.id == ALLOWED_ROLE_ID for role in member.roles)
 
 @bot.tree.command(name="edit", description="Edit website content (status, changelog, team)")
 @app_commands.describe(content_type="What do you want to edit?")
