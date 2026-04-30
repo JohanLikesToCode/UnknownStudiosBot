@@ -335,21 +335,41 @@ async def delete_webhook_message(msg_id: str):
         url = f"{STATUS_WEBHOOK}/messages/{msg_id}"
         await session.delete(url)
 
+async def verify_webhook_message(msg_id: str) -> bool:
+    """Check if a webhook message still exists on Discord."""
+    async with aiohttp.ClientSession() as session:
+        url = f"{STATUS_WEBHOOK}/messages/{msg_id}"
+        async with session.get(url) as resp:
+            return resp.status == 200
+
 async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
-    """Sync all incidents with webhook messages."""
-    ids = await load_webhook_ids()
+    """Sync all incidents with webhook messages, surviving bot restarts."""
+    ids = await load_webhook_ids()  # always fresh from GitHub
     new_ids = {}
 
     for inc in incidents:
         if inc.get('no_incidents'):
             continue
         key = f"{inc['date']}_{inc.get('title','')}"
-        existing = ids.get(key)
-        new_id = await post_or_update_webhook(inc, existing)
-        if new_id:
-            new_ids[key] = new_id
+        existing_id = ids.get(key)
 
-    # Delete webhook messages for removed incidents
+        if existing_id:
+            still_alive = await verify_webhook_message(existing_id)
+            if still_alive:
+                result_id = await post_or_update_webhook(inc, existing_id)
+                new_ids[key] = result_id or existing_id
+            else:
+                # Message was manually deleted — repost fresh
+                result_id = await post_or_update_webhook(inc, None)
+                if result_id:
+                    new_ids[key] = result_id
+        else:
+            # New incident — post for the first time
+            result_id = await post_or_update_webhook(inc, None)
+            if result_id:
+                new_ids[key] = result_id
+
+    # Remove webhook messages for incidents that were deleted
     for key, msg_id in ids.items():
         if key not in new_ids:
             await delete_webhook_message(msg_id)
