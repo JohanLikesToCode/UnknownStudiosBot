@@ -1,25 +1,28 @@
-# main.py
+import sys
+import os
+import warnings
+warnings.filterwarnings('ignore', category=SyntaxWarning)
+warnings.filterwarnings('ignore', category=DeprecationWarning)
+
 import discord
 from discord.ext import commands
+from discord import app_commands
 import json
-import os
 import asyncio
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import aiohttp
-from aiohttp import web
-from github import Github, InputGitTreeElement
 import base64
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from enum import Enum
 import re
-import keep_alive  # We'll create this separately
+from github import Github, Auth
 
 # Configuration
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
 GITHUB_REPO = os.getenv('GITHUB_REPO')  # Format: "username/repo"
-GUILD_ID = int(os.getenv('GUILD_ID', '0'))  # Optional: restrict to specific server
+GUILD_ID = os.getenv('GUILD_ID')  # Optional: restrict to specific server
 
 # File paths in your repo
 STATUS_FILE = "status.txt"
@@ -30,11 +33,44 @@ TEAM_FILE = "teams.json"
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-bot = commands.Bot(command_prefix='!', intents=intents)
 
-# GitHub client
-github_client = Github(GITHUB_TOKEN)
-repo = github_client.get_repo(GITHUB_REPO)
+class DiscordBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix='!', intents=intents)
+    
+    async def setup_hook(self):
+        # Sync commands to specific guild for immediate updates, or globally
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            print(f"Synced commands to guild {GUILD_ID}")
+        else:
+            await self.tree.sync()
+            print("Synced commands globally")
+    
+    async def on_ready(self):
+        print(f'{self.user} has connected to Discord!')
+        print(f'Bot is in {len(self.guilds)} guilds')
+        # Set bot status
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.watching,
+                name="GitHub repository"
+            )
+        )
+
+bot = DiscordBot()
+
+# GitHub client with new authentication
+if GITHUB_TOKEN:
+    auth = Auth.Token(GITHUB_TOKEN)
+    github_client = Github(auth=auth)
+    repo = github_client.get_repo(GITHUB_REPO)
+else:
+    github_client = None
+    repo = None
+    print("WARNING: GitHub token not configured!")
 
 class ContentManager:
     """Manages all content types and their file operations"""
@@ -44,14 +80,19 @@ class ContentManager:
     
     async def get_file_content(self, file_path: str) -> str:
         """Get file content from GitHub"""
+        if not repo:
+            return "Error: GitHub not configured"
         try:
             contents = repo.get_contents(file_path)
             return base64.b64decode(contents.content).decode('utf-8')
-        except:
+        except Exception as e:
+            print(f"Error fetching {file_path}: {e}")
             return ""
     
     async def commit_changes(self, file_path: str, content: str, commit_message: str, author: str):
         """Commit changes to GitHub"""
+        if not repo:
+            return False
         try:
             try:
                 contents = repo.get_contents(file_path)
@@ -274,7 +315,7 @@ class ContentView(discord.ui.View):
     """Interactive view for content management"""
     
     def __init__(self, session: ContentSession, manager: ContentManager):
-        super().__init__(timeout=300)  # 5 minute timeout
+        super().__init__(timeout=600)  # 10 minute timeout
         self.session = session
         self.manager = manager
         self.add_buttons()
@@ -283,11 +324,13 @@ class ContentView(discord.ui.View):
         """Add relevant buttons based on content type"""
         if self.session.content_type == ContentType.STATUS:
             self.add_item(AddIncidentButton())
+            self.add_item(AddUpdateButton())
             self.add_item(EditIncidentButton())
             self.add_item(RemoveIncidentButton())
         elif self.session.content_type == ContentType.CHANGELOG:
             self.add_item(AddVersionButton())
             self.add_item(EditVersionButton())
+            self.add_item(RemoveVersionButton())
         elif self.session.content_type == ContentType.TEAM:
             self.add_item(AddMemberButton())
             self.add_item(EditMemberButton())
@@ -296,18 +339,104 @@ class ContentView(discord.ui.View):
         self.add_item(SaveButton())
         self.add_item(CancelButton())
         self.add_item(RefreshButton())
+    
+    async def on_timeout(self):
+        """Clean up when view times out"""
+        try:
+            await self.session.message.delete()
+        except:
+            pass
 
 class AddIncidentButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Add Incident", style=discord.ButtonStyle.green, row=0)
+        super().__init__(label="➕ Add Incident", style=discord.ButtonStyle.green, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         modal = IncidentModal(self.view.session)
         await interaction.response.send_modal(modal)
 
+class AddUpdateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="📝 Add Update", style=discord.ButtonStyle.green, row=0)
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Which incident date do you want to add an update to? (e.g., 'Apr 30, 2025'):",
+            ephemeral=True
+        )
+        
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+        
+        try:
+            reply = await bot.wait_for('message', check=check, timeout=30)
+            date = reply.content.strip()
+            
+            incidents = status_manager.parse_status(self.view.session.original_content)
+            incident = next((i for i in incidents if i['date'] == date), None)
+            
+            if incident:
+                modal = UpdateModal(self.view.session, incident)
+                await reply.reply("Opening update modal...", ephemeral=True)
+                await interaction.followup.send_modal(modal)
+            else:
+                await reply.reply("Incident not found!", ephemeral=True)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Timed out!", ephemeral=True)
+
+class UpdateModal(discord.ui.Modal):
+    def __init__(self, session: ContentSession, incident: Dict):
+        super().__init__(title=f"Add Update to {incident['date']}")
+        
+        self.session = session
+        self.incident = incident
+        
+        self.timestamp = discord.ui.TextInput(
+            label="Timestamp",
+            placeholder="Apr 30, 14:30",
+            default=datetime.now().strftime("%b %d, %H:%M"),
+            required=True
+        )
+        
+        self.status = discord.ui.TextInput(
+            label="Status",
+            placeholder="INVESTIGATING/MONITORING/RESOLVED",
+            required=True
+        )
+        
+        self.description = discord.ui.TextInput(
+            label="Description",
+            placeholder="What's happening with this incident?",
+            required=True,
+            style=discord.TextStyle.paragraph
+        )
+        
+        self.add_item(self.timestamp)
+        self.add_item(self.status)
+        self.add_item(self.description)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        incidents = status_manager.parse_status(self.session.original_content)
+        
+        # Find and update the incident
+        for i, inc in enumerate(incidents):
+            if inc['date'] == self.incident['date']:
+                if 'updates' not in inc:
+                    inc['updates'] = []
+                inc['updates'].append({
+                    'timestamp': self.timestamp.value,
+                    'status': self.status.value,
+                    'description': self.description.value
+                })
+                break
+        
+        self.session.original_content = status_manager.format_status(incidents)
+        await update_display(self.session.message, self.session)
+        await interaction.response.send_message("Update added! Don't forget to save.", ephemeral=True)
+
 class EditIncidentButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Edit Incident", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="✏️ Edit Incident", style=discord.ButtonStyle.primary, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -322,7 +451,6 @@ class EditIncidentButton(discord.ui.Button):
             reply = await bot.wait_for('message', check=check, timeout=30)
             date = reply.content.strip()
             
-            # Find the incident
             incidents = status_manager.parse_status(self.view.session.original_content)
             incident = next((i for i in incidents if i['date'] == date), None)
             
@@ -337,7 +465,7 @@ class EditIncidentButton(discord.ui.Button):
 
 class RemoveIncidentButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Remove Incident", style=discord.ButtonStyle.red, row=0)
+        super().__init__(label="🗑️ Remove Incident", style=discord.ButtonStyle.red, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -443,7 +571,7 @@ class IncidentModal(discord.ui.Modal):
 
 class AddVersionButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Add Version", style=discord.ButtonStyle.green, row=0)
+        super().__init__(label="➕ Add Version", style=discord.ButtonStyle.green, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         modal = VersionModal(self.view.session)
@@ -451,7 +579,7 @@ class AddVersionButton(discord.ui.Button):
 
 class EditVersionButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Edit Version", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="✏️ Edit Version", style=discord.ButtonStyle.primary, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -474,6 +602,32 @@ class EditVersionButton(discord.ui.Button):
                 await interaction.followup.send_modal(modal)
             else:
                 await reply.reply("Version not found!", ephemeral=True)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Timed out!", ephemeral=True)
+
+class RemoveVersionButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🗑️ Remove Version", style=discord.ButtonStyle.red, row=0)
+    
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            "Which version would you like to remove? Reply with the version (e.g., '1.0.0'):",
+            ephemeral=True
+        )
+        
+        def check(m):
+            return m.author == interaction.user and m.channel == interaction.channel
+        
+        try:
+            reply = await bot.wait_for('message', check=check, timeout=30)
+            version = reply.content.strip()
+            
+            versions = changelog_manager.parse_changelog(self.view.session.original_content)
+            versions = [v for v in versions if v['version'] != version]
+            
+            self.view.session.original_content = changelog_manager.format_changelog(versions)
+            await update_display(self.view.session.message, self.view.session)
+            await reply.reply(f"Removed version {version}!", ephemeral=True)
         except asyncio.TimeoutError:
             await interaction.followup.send("Timed out!", ephemeral=True)
 
@@ -542,7 +696,7 @@ class VersionModal(discord.ui.Modal):
 
 class AddMemberButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Add Member", style=discord.ButtonStyle.green, row=0)
+        super().__init__(label="➕ Add Member", style=discord.ButtonStyle.green, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         modal = MemberModal(self.view.session)
@@ -550,7 +704,7 @@ class AddMemberButton(discord.ui.Button):
 
 class EditMemberButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Edit Member", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="✏️ Edit Member", style=discord.ButtonStyle.primary, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -578,7 +732,7 @@ class EditMemberButton(discord.ui.Button):
 
 class RemoveMemberButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="Remove Member", style=discord.ButtonStyle.red, row=0)
+        super().__init__(label="🗑️ Remove Member", style=discord.ButtonStyle.red, row=0)
     
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
@@ -694,6 +848,8 @@ class SaveButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         session = self.view.session
         
+        await interaction.response.defer(ephemeral=True)
+        
         if session.content_type == ContentType.STATUS:
             success = await status_manager.commit_changes(
                 session.file_path,
@@ -717,9 +873,9 @@ class SaveButton(discord.ui.Button):
             )
         
         if success:
-            await interaction.response.send_message("✅ Changes saved to GitHub!", ephemeral=True)
+            await interaction.followup.send("✅ Changes saved to GitHub!", ephemeral=True)
         else:
-            await interaction.response.send_message("❌ Failed to save changes!", ephemeral=True)
+            await interaction.followup.send("❌ Failed to save changes! Check bot logs.", ephemeral=True)
 
 class CancelButton(discord.ui.Button):
     def __init__(self):
@@ -764,33 +920,28 @@ def get_manager(content_type: ContentType) -> ContentManager:
     elif content_type == ContentType.TEAM:
         return team_manager
 
-@bot.event
-async def on_ready():
-    print(f'{bot.user} has connected to Discord!')
-    print(f'Bot is in {len(bot.guilds)} guilds')
-    
-    # Clean up any old messages from previous sessions
-    # This happens automatically since messages aren't persisted
-
-@bot.slash_command(name="edit", description="Start editing website content")
-async def edit_content(
-    ctx: discord.ApplicationContext,
-    content_type: discord.Option(str, "Type of content to edit", choices=[
-        discord.OptionChoice(name="Status", value="status"),
-        discord.OptionChoice(name="Changelog", value="changelog"),
-        discord.OptionChoice(name="Team", value="team")
-    ])
-):
+# Slash Commands
+@bot.tree.command(name="edit", description="Start editing website content")
+@app_commands.describe(content_type="Type of content to edit")
+@app_commands.choices(content_type=[
+    app_commands.Choice(name="Status", value="status"),
+    app_commands.Choice(name="Changelog", value="changelog"),
+    app_commands.Choice(name="Team", value="team")
+])
+async def edit_content(interaction: discord.Interaction, content_type: app_commands.Choice[str]):
     """Start an editing session for website content"""
     
-    # Check permissions (adjust role names as needed)
+    # Check permissions
     allowed_roles = ["Developer", "Admin", "Content Editor"]
-    if not any(role.name in allowed_roles for role in ctx.author.roles):
-        await ctx.respond("You don't have permission to edit content!", ephemeral=True)
+    if not any(role.name in allowed_roles for role in interaction.user.roles):
+        await interaction.response.send_message(
+            "You don't have permission to edit content! Required roles: Developer, Admin, or Content Editor",
+            ephemeral=True
+        )
         return
     
     # Get current content from GitHub
-    content_type_enum = ContentType(content_type)
+    content_type_enum = ContentType(content_type.value)
     
     if content_type_enum == ContentType.STATUS:
         file_path = STATUS_FILE
@@ -802,6 +953,8 @@ async def edit_content(
         file_path = TEAM_FILE
         manager = team_manager
     
+    await interaction.response.defer()
+    
     # Fetch current content
     content = await manager.get_file_content(file_path)
     
@@ -811,13 +964,13 @@ async def edit_content(
         data=None,
         original_content=content,
         file_path=file_path,
-        author=ctx.author,
+        author=interaction.user,
         message=None
     )
     
     # Send interactive message
     embed = discord.Embed(
-        title=f"📝 Editing {content_type.title()}",
+        title=f"📝 Editing {content_type.name}",
         description="Use the buttons below to make changes. Click Save when done.",
         color=discord.Color.blue()
     )
@@ -828,32 +981,31 @@ async def edit_content(
         display_content += "\n... (truncated)"
     
     embed.add_field(name="Current Content", value=f"```{display_content}```", inline=False)
-    embed.set_footer(text=f"Editor: {ctx.author.name}")
+    embed.set_footer(text=f"Editor: {interaction.user.name}")
     
     view = ContentView(session, manager)
-    message = await ctx.respond(embed=embed, view=view)
+    await interaction.followup.send(embed=embed, view=view)
     
-    # Store message reference in session
-    if hasattr(message, 'message'):
-        session.message = message.message
-    else:
-        session.message = message
+    # Store message reference
+    message = await interaction.original_response()
+    session.message = message
 
-@bot.slash_command(name="view", description="View current website content")
-async def view_content(
-    ctx: discord.ApplicationContext,
-    content_type: discord.Option(str, "Type of content to view", choices=[
-        discord.OptionChoice(name="Status", value="status"),
-        discord.OptionChoice(name="Changelog", value="changelog"),
-        discord.OptionChoice(name="Team", value="team")
-    ])
-):
+@bot.tree.command(name="view", description="View current website content")
+@app_commands.describe(content_type="Type of content to view")
+@app_commands.choices(content_type=[
+    app_commands.Choice(name="Status", value="status"),
+    app_commands.Choice(name="Changelog", value="changelog"),
+    app_commands.Choice(name="Team", value="team")
+])
+async def view_content(interaction: discord.Interaction, content_type: app_commands.Choice[str]):
     """View current website content without editing"""
     
-    if content_type == "status":
+    await interaction.response.defer()
+    
+    if content_type.value == "status":
         file_path = STATUS_FILE
         manager = status_manager
-    elif content_type == "changelog":
+    elif content_type.value == "changelog":
         file_path = CHANGELOG_FILE
         manager = changelog_manager
     else:
@@ -866,16 +1018,19 @@ async def view_content(
     if len(content) > 1900:
         content = content[:1900] + "\n... (truncated)"
     
+    if not content:
+        content = "No content found or error fetching file."
+    
     embed = discord.Embed(
-        title=f"📄 Current {content_type.title()}",
+        title=f"📄 Current {content_type.name}",
         description=f"```{content}```",
         color=discord.Color.green()
     )
     
-    await ctx.respond(embed=embed)
+    await interaction.followup.send(embed=embed)
 
-@bot.slash_command(name="help_editor", description="Show help for the content editor")
-async def help_editor(ctx: discord.ApplicationContext):
+@bot.tree.command(name="help_editor", description="Show help for the content editor")
+async def help_editor(interaction: discord.Interaction):
     """Show help information for the content editor"""
     
     embed = discord.Embed(
@@ -892,19 +1047,19 @@ async def help_editor(ctx: discord.ApplicationContext):
     
     embed.add_field(
         name="Editing Status",
-        value="• Add/Edit/Remove incidents\n• Each incident has date, type, severity, components\n• Add updates with timestamps",
+        value="• Add/Edit/Remove incidents\n• Add updates to existing incidents\n• Each incident has date, type, severity, components",
         inline=False
     )
     
     embed.add_field(
         name="Editing Changelog",
-        value="• Add/Edit versions\n• Each version has entries with type (FEATURE/FIX/UX/etc)\n• Entries format: TYPE Description",
+        value="• Add/Edit/Remove versions\n• Each version has entries with type (FEATURE/FIX/UX/PERF/etc)\n• Entries format: TYPE Description",
         inline=False
     )
     
     embed.add_field(
         name="Editing Team",
-        value="• Add/Edit/Remove team members\n• Each member has ID, name, handle, roles, about\n• Timeline and skills can be added later",
+        value="• Add/Edit/Remove team members\n• Each member has ID, name, handle, roles, about\n• Timeline and skills can be managed through bot",
         inline=False
     )
     
@@ -916,25 +1071,4 @@ async def help_editor(ctx: discord.ApplicationContext):
     
     embed.set_footer(text="Only authorized roles can edit content")
     
-    await ctx.respond(embed=embed)
-
-# Keep-alive web server for Render
-from flask import Flask
-from threading import Thread
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is running!"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-if __name__ == "__main__":
-    keep_alive()
-    bot.run(DISCORD_TOKEN)
+    await interaction.response.send_message(embed=embed)
