@@ -694,6 +694,30 @@ async def do_delete(interaction: discord.Interaction, session: Session):
     session.selected_index = None
     await interaction.response.edit_message(embed=build_embed(session), view=build_view(session))
 
+async def do_delete_with_full_view(interaction: discord.Interaction, session: Session):
+    """Delete selected item and return to main view with all buttons visible."""
+    idx = session.selected_index
+    if session.content_type == ContentType.STATUS:
+        items = parse_status(session.raw)
+        items.pop(idx)
+        session.raw = format_status(items)
+    elif session.content_type == ContentType.CHANGELOG:
+        items = parse_changelog(session.raw)
+        items.pop(idx)
+        session.raw = format_changelog(items)
+    elif session.content_type == ContentType.TEAM:
+        team = parse_team(session.raw)
+        team['members'].pop(idx)
+        session.raw = format_team(team)
+    elif session.content_type == ContentType.BLOG:
+        items = parse_blog(session.raw)
+        items.pop(idx)
+        session.raw = format_blog(items)
+    session.selected_index = None
+    # Return to the full main view with all action buttons
+    view = build_view(session)
+    await interaction.response.edit_message(embed=build_embed(session), view=view)
+
 # ─── Component Selector ───────────────────────────────────────────────────────
 class ComponentSelector(discord.ui.Select):
     def __init__(self, session: Session, modal_ref):
@@ -1095,10 +1119,18 @@ class ActionDropdown(discord.ui.Select):
             await interaction.response.send_modal(VersionModal(self.session))
         elif action == "add_member":
             await interaction.response.send_modal(MemberModal(self.session))
+        elif action == "add_post":
+            await interaction.response.send_modal(BlogPostModal(self.session))
         elif action in ("edit", "delete", "add_update"):
             view = discord.ui.View(timeout=60)
             view.add_item(SelectItemDropdown(self.session, action))
-            await interaction.response.edit_message(view=view)
+            # Add a Back button so user can return to main view
+            back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+            async def back_callback(interaction: discord.Interaction):
+                await interaction.response.edit_message(embed=build_embed(self.session), view=build_view(self.session))
+            back_button.callback = back_callback
+            view.add_item(back_button)
+            await interaction.response.edit_message(embed=build_embed(self.session), view=view)
         elif action == "save_status":
             await interaction.response.defer()
             ok = await commit_file(self.session.file_path, self.session.raw, "Update status", str(self.session.author))
@@ -1113,7 +1145,14 @@ class ActionDropdown(discord.ui.Select):
                 await interaction.followup.send("❌ Failed to save!", ephemeral=True)
         elif action == "save":
             await interaction.response.defer()
-            label = "changelog" if self.session.content_type == ContentType.CHANGELOG else "team"
+            if self.session.content_type == ContentType.CHANGELOG:
+                label = "changelog"
+            elif self.session.content_type == ContentType.TEAM:
+                label = "team"
+            elif self.session.content_type == ContentType.BLOG:
+                label = "blog"
+            else:
+                label = "content"
             ok = await commit_file(self.session.file_path, self.session.raw, f"Update {label}", str(self.session.author))
             if ok:
                 embed = build_embed(self.session)
@@ -1159,21 +1198,19 @@ class StatusView(discord.ui.View):
 
     @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary, row=1)
     async def edit_incident(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = discord.ui.View(timeout=60)
-        view.add_item(SelectItemDropdown(self.session, "edit"))
-        await interaction.response.edit_message(view=view)
+        # Create a new view with BOTH the select dropdown AND the action buttons
+        view = self.create_select_view("edit")
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="📝 Add Update", style=discord.ButtonStyle.primary, row=1)
     async def add_update(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = discord.ui.View(timeout=60)
-        view.add_item(SelectItemDropdown(self.session, "add_update"))
-        await interaction.response.edit_message(view=view)
+        view = self.create_select_view("add_update")
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger, row=1)
     async def delete_incident(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = discord.ui.View(timeout=60)
-        view.add_item(SelectItemDropdown(self.session, "delete"))
-        await interaction.response.edit_message(view=view)
+        view = self.create_select_view("delete")
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="💾 Save & Post", style=discord.ButtonStyle.success, row=2)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1193,6 +1230,19 @@ class StatusView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         sessions.pop(self.session.author.id, None)
         await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
+    def create_select_view(self, action: str):
+        """Create a view with both the select dropdown and action buttons"""
+        view = discord.ui.View(timeout=600)
+        view.add_item(SelectItemDropdown(self.session, action))
+        # Add a "Back" button to return to main view
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        back_button.callback = self.back_to_main
+        view.add_item(back_button)
+        return view
+
+    async def back_to_main(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=build_embed(self.session), view=self)
 
 class ChangelogView(discord.ui.View):
     def __init__(self, session: Session):
@@ -1217,13 +1267,24 @@ class ChangelogView(discord.ui.View):
     async def edit_version(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "edit"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="🗑️ Delete Version", style=discord.ButtonStyle.danger, row=1)
     async def delete_version(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "delete"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
 
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1265,13 +1326,23 @@ class BlogView(discord.ui.View):
     async def edit_post(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "edit"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="🗑️ Delete Post", style=discord.ButtonStyle.danger, row=1)
     async def delete_post(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "delete"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1313,13 +1384,23 @@ class TeamView(discord.ui.View):
     async def edit_member(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "edit"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="🗑️ Remove Member", style=discord.ButtonStyle.danger, row=1)
     async def remove_member(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = discord.ui.View(timeout=60)
         view.add_item(SelectItemDropdown(self.session, "delete"))
-        await interaction.response.edit_message(view=view)
+        back_button = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
+        async def back_callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(embed=build_embed(self.session), view=self)
+        back_button.callback = back_callback
+        view.add_item(back_button)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1436,11 +1517,11 @@ async def help_editor(interaction: discord.Interaction):
     embed.add_field(name="Status", value="• Add incidents with type, severity, components & tasks\n• **Tasks are required** on every incident\n• Add timestamped updates (INVESTIGATING → MONITORING → RESOLVED)\n• Saving auto-posts/edits the webhook channel message", inline=False)
     embed.add_field(name="Changelog", value="• Add versions with date and typed entries\n• Entry format: `TYPE Description` (FEATURE, FIX, BREAKING, etc.)", inline=False)
     embed.add_field(name="Team", value="• Add/edit/remove team members\n• Fields: ID, name, Discord handle, roles, bio", inline=False)
+    embed.add_field(name="Blog", value="• Add blog posts with ID, title, subheading, date, author, category, feature image\n• Content uses BLOCK system: paragraph, heading, subheading, image, two_column, accordion, slideshow, code, callout, quote, list, divider\n• Each post appears on the /blog page", inline=False)
     embed.add_field(name="Webhook behaviour", value="• Each incident gets its own message in the status channel\n• Saving updates that message in-place\n• Deleting an incident removes its webhook message\n• Resolving keeps the message but marks it resolved", inline=False)
     embed.set_footer(text="All editor sessions are ephemeral (only visible to you)")
     await interaction.response.send_message(embed=embed, ephemeral=True)
-    embed.add_field(name="Blog", value="• Add blog posts with ID, title, subheading, date, author, category, feature image\n• Content uses BLOCK system: paragraph, heading, subheading, image, two_column, accordion, slideshow, code, callout, quote, list, divider\n• Each post appears on the /blog page", inline=False)
-
+    
 # ─── Keep-alive ───────────────────────────────────────────────────────────────
 from flask import Flask
 from threading import Thread
