@@ -1360,7 +1360,12 @@ async def edit_content(interaction: discord.Interaction, content_type: app_comma
     await interaction.response.defer(ephemeral=True)
 
     ct = ContentType(content_type.value)
-    fp = {ContentType.STATUS: STATUS_FILE, ContentType.CHANGELOG: CHANGELOG_FILE, ContentType.TEAM: TEAM_FILE}[ct]
+    fp = {
+        ContentType.STATUS: STATUS_FILE, 
+        ContentType.CHANGELOG: CHANGELOG_FILE, 
+        ContentType.TEAM: TEAM_FILE,
+        ContentType.BLOG: BLOG_FILE
+    }[ct]
 
     raw = await get_file_content(fp)
     if not raw:
