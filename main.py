@@ -45,6 +45,7 @@ if not DISCORD_TOKEN:
 STATUS_FILE    = "status.txt"
 CHANGELOG_FILE = "changelog.txt"
 TEAM_FILE      = "teams.json"
+BLOG_FILE      = "blogs.txt"
 WEBHOOK_IDS_FILE = "webhook_message_ids.json"  # track posted webhook messages
 
 # ─── Components list (edit as needed) ────────────────────────────────────────
@@ -269,6 +270,102 @@ def parse_team(content: str) -> Dict:
 def format_team(data: Dict) -> str:
     return json.dumps(data, indent=2)
 
+# ─── Blog Parsing ───────────────────────────────────────────────────────────────
+def parse_blog(content: str) -> List[Dict]:
+    """Parse blog posts from text format into structured data."""
+    posts = []
+    blocks = content.split("\n=====================================\n")
+    
+    for block in blocks:
+        if not block.strip():
+            continue
+        
+        lines = block.strip().split('\n')
+        post = {
+            'id': '',
+            'title': '',
+            'subheading': '',
+            'date': '',
+            'author': '',
+            'category': 'general',
+            'featureImage': '',
+            'content': []
+        }
+        
+        i = 0
+        in_content = False
+        current_content = []
+        
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            if not in_content:
+                if line.startswith('ID:'):
+                    post['id'] = line.replace('ID:', '').strip()
+                elif line.startswith('TITLE:'):
+                    post['title'] = line.replace('TITLE:', '').strip()
+                elif line.startswith('SUBHEADING:'):
+                    post['subheading'] = line.replace('SUBHEADING:', '').strip()
+                elif line.startswith('DATE:'):
+                    post['date'] = line.replace('DATE:', '').strip()
+                elif line.startswith('AUTHOR:'):
+                    post['author'] = line.replace('AUTHOR:', '').strip()
+                elif line.startswith('CATEGORY:'):
+                    post['category'] = line.replace('CATEGORY:', '').strip().lower()
+                elif line.startswith('IMAGE:'):
+                    post['featureImage'] = line.replace('IMAGE:', '').strip()
+                elif line == 'CONTENT_START':
+                    in_content = True
+            else:
+                if line == 'CONTENT_END':
+                    break
+                elif line.startswith('BLOCK:'):
+                    # Parse block
+                    block_type = line.replace('BLOCK:', '').strip()
+                    i += 1
+                    if i < len(lines):
+                        block_data = lines[i].strip()
+                        current_content.append({
+                            'type': block_type,
+                            'data': block_data
+                        })
+                elif current_content and current_content[-1].get('data') and not line.startswith('BLOCK:'):
+                    # Multi-line block content
+                    current_content[-1]['data'] += '\n' + line
+            
+            i += 1
+        
+        post['content'] = current_content
+        if post['id'] and post['title']:
+            posts.append(post)
+    
+    return posts
+
+def format_blog(posts: List[Dict]) -> str:
+    """Convert blog posts back to text format."""
+    lines = []
+    for i, post in enumerate(posts):
+        lines.append(f"ID: {post['id']}")
+        lines.append(f"TITLE: {post['title']}")
+        if post.get('subheading'):
+            lines.append(f"SUBHEADING: {post['subheading']}")
+        lines.append(f"DATE: {post.get('date', datetime.now().strftime('%Y-%m-%d'))}")
+        lines.append(f"AUTHOR: {post.get('author', 'Unknown')}")
+        lines.append(f"CATEGORY: {post.get('category', 'general')}")
+        if post.get('featureImage'):
+            lines.append(f"IMAGE: {post['featureImage']}")
+        lines.append("CONTENT_START")
+        
+        for block in post.get('content', []):
+            lines.append(f"BLOCK: {block['type']}")
+            lines.append(block['data'])
+        
+        lines.append("CONTENT_END")
+        if i < len(posts) - 1:
+            lines.append("\n=====================================\n")
+    
+    return '\n'.join(lines)
+
 # ─── Webhook Formatting ───────────────────────────────────────────────────────
 def format_webhook_message(incident: Dict) -> str:
     inc_type  = incident.get('type', 'INCIDENT')
@@ -381,6 +478,7 @@ class ContentType(Enum):
     STATUS    = "status"
     CHANGELOG = "changelog"
     TEAM      = "team"
+    BLOG      = "blog"
 
 @dataclass
 class Session:
@@ -472,13 +570,36 @@ def build_team_embed(session: Session) -> discord.Embed:
         )
     return embed
 
+def build_blog_embed(session: Session) -> discord.Embed:
+    posts = parse_blog(session.raw)
+    embed = discord.Embed(title="📝 Blog Editor", color=0xF1C40F)
+    embed.set_footer(text=f"Editor: {session.author.display_name} • Session expires in 10 min")
+    
+    if not posts:
+        embed.description = "*No blog posts found.*"
+        return embed
+    
+    for i, p in enumerate(posts):
+        selected = session.selected_index == i
+        marker = "▶ " if selected else ""
+        content_preview = p.get('subheading', '')[:80] or (p.get('content', [{}])[0].get('data', '')[:80] if p.get('content') else '')
+        
+        embed.add_field(
+            name=f"{marker}[{i+1}] {p['title']} — {p.get('date', '?')}",
+            value=f"📁 {p.get('category', 'general').upper()}\n✍️ {p.get('author', 'Unknown')}\n{content_preview}…" if content_preview else f"📁 {p.get('category', 'general').upper()}\n✍️ {p.get('author', 'Unknown')}",
+            inline=False
+        )
+    return embed
+
 def build_embed(session: Session) -> discord.Embed:
     if session.content_type == ContentType.STATUS:
         return build_status_embed(session)
     elif session.content_type == ContentType.CHANGELOG:
         return build_changelog_embed(session)
-    else:
+    elif session.content_type == ContentType.TEAM:
         return build_team_embed(session)
+    elif session.content_type == ContentType.BLOG:
+        return build_blog_embed(session)
 
 # ─── Select Menus ─────────────────────────────────────────────────────────────
 class SelectItemDropdown(discord.ui.Select):
@@ -505,6 +626,9 @@ class SelectItemDropdown(discord.ui.Select):
         elif self.session.content_type == ContentType.TEAM:
             for i, m in enumerate(parse_team(self.session.raw).get('members', [])):
                 opts.append(discord.SelectOption(label=f"{m.get('name','?')} (@{m.get('handle','?')})", value=str(i), emoji='👤'))
+        elif self.session.content_type == ContentType.BLOG:
+            for i, p in enumerate(parse_blog(self.session.raw)):
+                opts.append(discord.SelectOption(label=f"{p['title'][:80]}", value=str(i), emoji='📝'))
         return opts
 
     async def callback(self, interaction: discord.Interaction):
@@ -539,6 +663,10 @@ async def launch_edit_modal(interaction: discord.Interaction, session: Session):
         team = parse_team(session.raw)
         member = team['members'][session.selected_index]
         await interaction.response.send_modal(MemberModal(session, member))
+    elif session.content_type == ContentType.BLOG:
+        posts = parse_blog(session.raw)
+        post = posts[session.selected_index]
+        await interaction.response.send_modal(BlogPostModal(session, post))
 
 async def launch_update_modal(interaction: discord.Interaction, session: Session):
     incidents = parse_status(session.raw)
@@ -559,6 +687,10 @@ async def do_delete(interaction: discord.Interaction, session: Session):
         team = parse_team(session.raw)
         team['members'].pop(idx)
         session.raw = format_team(team)
+    elif session.content_type == ContentType.BLOG:
+        items = parse_blog(session.raw)
+        items.pop(idx)
+        session.raw = format_blog(items)
     session.selected_index = None
     await interaction.response.edit_message(embed=build_embed(session), view=build_view(session))
 
@@ -842,6 +974,113 @@ class MemberModal(discord.ui.Modal):
         self.session.selected_index = None
         await interaction.response.edit_message(embed=build_embed(self.session), view=build_view(self.session))
 
+class BlogPostModal(discord.ui.Modal):
+    def __init__(self, session: Session, existing: Optional[Dict] = None):
+        super().__init__(title="Edit Blog Post" if existing else "New Blog Post")
+        self.session = session
+        self.existing = existing
+
+        self.f_id = discord.ui.TextInput(
+            label="Post ID (slug, no spaces)",
+            placeholder="my-awesome-post",
+            default=existing['id'] if existing else '',
+            max_length=100
+        )
+        self.f_title = discord.ui.TextInput(
+            label="Title",
+            placeholder="My Awesome Blog Post",
+            default=existing.get('title', '') if existing else '',
+            max_length=200
+        )
+        self.f_subheading = discord.ui.TextInput(
+            label="Subheading",
+            placeholder="A brief description of this post",
+            default=existing.get('subheading', '') if existing else '',
+            required=False,
+            max_length=300
+        )
+        self.f_date = discord.ui.TextInput(
+            label="Date",
+            placeholder="YYYY-MM-DD",
+            default=existing.get('date', datetime.now().strftime("%Y-%m-%d")) if existing else datetime.now().strftime("%Y-%m-%d"),
+            max_length=20
+        )
+        self.f_author = discord.ui.TextInput(
+            label="Author (Discord name)",
+            placeholder="Johan",
+            default=existing.get('author', '') if existing else '',
+            max_length=100
+        )
+        self.f_category = discord.ui.TextInput(
+            label="Category",
+            placeholder="announcements, guides, security, updates",
+            default=existing.get('category', 'general') if existing else 'general',
+            max_length=50
+        )
+        self.f_image = discord.ui.TextInput(
+            label="Feature Image URL",
+            placeholder="https://example.com/image.jpg",
+            default=existing.get('featureImage', '') if existing else '',
+            required=False,
+            max_length=500
+        )
+        self.f_content = discord.ui.TextInput(
+            label="Content (format: BLOCK:type\ndata)",
+            placeholder="BLOCK:paragraph\nWelcome to my post!\nBLOCK:heading\nSection Title\nBLOCK:image\nhttps://example.com/img.jpg\nCaption here",
+            default='\n'.join(f"BLOCK:{b['type']}\n{b['data']}" for b in existing.get('content', [])) if existing else '',
+            style=discord.TextStyle.paragraph,
+            max_length=4000
+        )
+
+        self.add_item(self.f_id)
+        self.add_item(self.f_title)
+        self.add_item(self.f_subheading)
+        self.add_item(self.f_date)
+        self.add_item(self.f_author)
+        self.add_item(self.f_category)
+        self.add_item(self.f_image)
+        self.add_item(self.f_content)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        posts = parse_blog(self.session.raw)
+        
+        # Parse content blocks
+        content_blocks = []
+        lines = self.f_content.value.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('BLOCK:'):
+                block_type = line.replace('BLOCK:', '').strip()
+                i += 1
+                if i < len(lines):
+                    block_data = lines[i].strip()
+                    content_blocks.append({'type': block_type, 'data': block_data})
+            i += 1
+        
+        new_post = {
+            'id': self.f_id.value.strip().lower().replace(' ', '-'),
+            'title': self.f_title.value.strip(),
+            'subheading': self.f_subheading.value.strip(),
+            'date': self.f_date.value.strip(),
+            'author': self.f_author.value.strip(),
+            'category': self.f_category.value.strip().lower(),
+            'featureImage': self.f_image.value.strip(),
+            'content': content_blocks
+        }
+        
+        if self.existing:
+            for i, p in enumerate(posts):
+                if p['id'] == self.existing['id']:
+                    posts[i] = new_post
+                    break
+        else:
+            posts.insert(0, new_post)
+        
+        self.session.raw = format_blog(posts)
+        self.session.selected_index = None
+        await interaction.response.edit_message(embed=build_embed(self.session), view=build_view(self.session))
+
 class ActionDropdown(discord.ui.Select):
     def __init__(self, session: Session, actions: list[tuple[str, str]]):
         self.session = session
@@ -893,8 +1132,10 @@ def build_view(session: Session) -> discord.ui.View:
         return StatusView(session)
     elif session.content_type == ContentType.CHANGELOG:
         return ChangelogView(session)
-    else:
+    elif session.content_type == ContentType.TEAM:
         return TeamView(session)
+    elif session.content_type == ContentType.BLOG:
+        return BlogView(session)
 
 class StatusView(discord.ui.View):
     def __init__(self, session: Session):
@@ -1001,6 +1242,54 @@ class ChangelogView(discord.ui.View):
         sessions.pop(self.session.author.id, None)
         await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
 
+class BlogView(discord.ui.View):
+    def __init__(self, session: Session):
+        super().__init__(timeout=600)
+        self.session = session
+        self.add_item(ActionDropdown(session, [
+            ("➕ New Post",     "add_post"),
+            ("✏️ Edit Post",    "edit"),
+            ("🗑️ Delete Post",  "delete"),
+            ("💾 Save",         "save"),
+            ("↩️ Cancel",       "cancel"),
+        ]))
+
+    async def on_timeout(self):
+        sessions.pop(self.session.author.id, None)
+
+    @discord.ui.button(label="➕ New Post", style=discord.ButtonStyle.success, row=1)
+    async def add_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BlogPostModal(self.session))
+
+    @discord.ui.button(label="✏️ Edit Post", style=discord.ButtonStyle.primary, row=1)
+    async def edit_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=60)
+        view.add_item(SelectItemDropdown(self.session, "edit"))
+        await interaction.response.edit_message(view=view)
+
+    @discord.ui.button(label="🗑️ Delete Post", style=discord.ButtonStyle.danger, row=1)
+    async def delete_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        view = discord.ui.View(timeout=60)
+        view.add_item(SelectItemDropdown(self.session, "delete"))
+        await interaction.response.edit_message(view=view)
+
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ok = await commit_file(self.session.file_path, self.session.raw, "Update blog", str(self.session.author))
+        if ok:
+            embed = build_embed(self.session)
+            embed.color = 0x57F287
+            embed.set_footer(text="✅ Saved to GitHub!")
+            await interaction.edit_original_response(embed=embed, view=self)
+        else:
+            await interaction.followup.send("❌ Failed to save! Check GitHub token.", ephemeral=True)
+
+    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=2)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sessions.pop(self.session.author.id, None)
+        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
 class TeamView(discord.ui.View):
     def __init__(self, session: Session):
         super().__init__(timeout=600)
@@ -1055,12 +1344,13 @@ ALLOWED_ROLE_ID = 1444271393570160680
 def has_permission(member: discord.Member) -> bool:
     return any(role.id == ALLOWED_ROLE_ID for role in member.roles)
 
-@bot.tree.command(name="edit", description="Edit website content (status, changelog, team)")
+@bot.tree.command(name="edit", description="Edit website content (status, changelog, team, blog)")
 @app_commands.describe(content_type="What do you want to edit?")
 @app_commands.choices(content_type=[
     app_commands.Choice(name="Status",    value="status"),
     app_commands.Choice(name="Changelog", value="changelog"),
     app_commands.Choice(name="Team",      value="team"),
+    app_commands.Choice(name="Blog",      value="blog"),  # ADD THIS
 ])
 async def edit_content(interaction: discord.Interaction, content_type: app_commands.Choice[str]):
     if not has_permission(interaction.user):
@@ -1095,12 +1385,18 @@ async def edit_content(interaction: discord.Interaction, content_type: app_comma
     app_commands.Choice(name="Status",    value="status"),
     app_commands.Choice(name="Changelog", value="changelog"),
     app_commands.Choice(name="Team",      value="team"),
+    app_commands.Choice(name="Blog",      value="blog"),  # ADD THIS
 ])
 async def view_content(interaction: discord.Interaction, content_type: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
 
     ct = ContentType(content_type.value)
-    fp = {ContentType.STATUS: STATUS_FILE, ContentType.CHANGELOG: CHANGELOG_FILE, ContentType.TEAM: TEAM_FILE}[ct]
+    fp = {
+        ContentType.STATUS: STATUS_FILE,
+        ContentType.CHANGELOG: CHANGELOG_FILE,
+        ContentType.TEAM: TEAM_FILE,
+        ContentType.BLOG: BLOG_FILE  # ADD THIS
+    }[ct]
 
     raw = await get_file_content(fp)
     if not raw:
@@ -1138,6 +1434,7 @@ async def help_editor(interaction: discord.Interaction):
     embed.add_field(name="Webhook behaviour", value="• Each incident gets its own message in the status channel\n• Saving updates that message in-place\n• Deleting an incident removes its webhook message\n• Resolving keeps the message but marks it resolved", inline=False)
     embed.set_footer(text="All editor sessions are ephemeral (only visible to you)")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    embed.add_field(name="Blog", value="• Add blog posts with ID, title, subheading, date, author, category, feature image\n• Content uses BLOCK system: paragraph, heading, subheading, image, two_column, accordion, slideshow, code, callout, quote, list, divider\n• Each post appears on the /blog page", inline=False)
 
 # ─── Keep-alive ───────────────────────────────────────────────────────────────
 from flask import Flask
