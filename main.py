@@ -274,9 +274,9 @@ def format_team(data: Dict) -> str:
 def parse_blog(content: str) -> List[Dict]:
     """Parse blog posts from text format into structured data."""
     posts = []
-    blocks = content.split("\n=====================================\n")
+    blocks_raw = content.split("\n=====================================\n")
     
-    for block in blocks:
+    for block in blocks_raw:
         if not block.strip():
             continue
         
@@ -292,55 +292,65 @@ def parse_blog(content: str) -> List[Dict]:
             'content': []
         }
         
-        i = 0
         in_content = False
-        current_content = []
+        current_block_type = None
+        current_block_lines = []
         
-        while i < len(lines):
-            line = lines[i].strip()
+        def flush_block():
+            nonlocal current_block_type, current_block_lines
+            if current_block_type and (current_block_type == 'divider' or current_block_lines):
+                post['content'].append({
+                    'type': current_block_type,
+                    'data': '\n'.join(current_block_lines) if current_block_type != 'divider' else ''
+                })
+            current_block_type = None
+            current_block_lines = []
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            
+            if stripped == 'CONTENT_START':
+                in_content = True
+                continue
+            elif stripped == 'CONTENT_END':
+                flush_block()
+                in_content = False
+                continue
             
             if not in_content:
-                if line.startswith('ID:'):
-                    post['id'] = line.replace('ID:', '').strip()
-                elif line.startswith('TITLE:'):
-                    post['title'] = line.replace('TITLE:', '').strip()
-                elif line.startswith('SUBHEADING:'):
-                    post['subheading'] = line.replace('SUBHEADING:', '').strip()
-                elif line.startswith('DATE:'):
-                    post['date'] = line.replace('DATE:', '').strip()
-                elif line.startswith('AUTHOR:'):
-                    post['author'] = line.replace('AUTHOR:', '').strip()
-                elif line.startswith('CATEGORY:'):
-                    post['category'] = line.replace('CATEGORY:', '').strip().lower()
-                elif line.startswith('IMAGE:'):
-                    post['featureImage'] = line.replace('IMAGE:', '').strip()
-                elif line == 'CONTENT_START':
-                    in_content = True
+                if stripped.startswith('ID:'):
+                    post['id'] = stripped.replace('ID:', '').strip()
+                elif stripped.startswith('TITLE:'):
+                    post['title'] = stripped.replace('TITLE:', '').strip()
+                elif stripped.startswith('SUBHEADING:'):
+                    post['subheading'] = stripped.replace('SUBHEADING:', '').strip()
+                elif stripped.startswith('DATE:'):
+                    post['date'] = stripped.replace('DATE:', '').strip()
+                elif stripped.startswith('AUTHOR:'):
+                    post['author'] = stripped.replace('AUTHOR:', '').strip()
+                elif stripped.startswith('CATEGORY:'):
+                    post['category'] = stripped.replace('CATEGORY:', '').strip().lower()
+                elif stripped.startswith('IMAGE:'):
+                    post['featureImage'] = stripped.replace('IMAGE:', '').strip()
             else:
-                if line == 'CONTENT_END':
-                    break
-                elif line.startswith('BLOCK:'):
-                    # Parse block
-                    block_type = line.replace('BLOCK:', '').strip()
-                    i += 1
-                    if i < len(lines):
-                        block_data = lines[i].strip()
-                        current_content.append({
-                            'type': block_type,
-                            'data': block_data
-                        })
-                elif current_content and current_content[-1].get('data') and not line.startswith('BLOCK:'):
-                    # Multi-line block content
-                    current_content[-1]['data'] += '\n' + line
-            
-            i += 1
+                if stripped.startswith('BLOCK:'):
+                    flush_block()
+                    current_block_type = stripped.replace('BLOCK:', '').strip()
+                    # Divider has no content
+                    if current_block_type == 'divider':
+                        flush_block()
+                elif current_block_type:
+                    # Collect lines for current block (keep original, not stripped)
+                    current_block_lines.append(line)
         
-        post['content'] = current_content
+        # Don't forget to flush the last block
+        flush_block()
+        
         if post['id'] and post['title']:
             posts.append(post)
     
     return posts
-
+    
 def format_blog(posts: List[Dict]) -> str:
     """Convert blog posts back to text format."""
     lines = []
@@ -358,7 +368,9 @@ def format_blog(posts: List[Dict]) -> str:
         
         for block in post.get('content', []):
             lines.append(f"BLOCK: {block['type']}")
-            lines.append(block['data'])
+            if block['type'] != 'divider':
+                # Preserve multi-line content
+                lines.append(block['data'])
         
         lines.append("CONTENT_END")
         if i < len(posts) - 1:
@@ -783,32 +795,60 @@ class IncidentModal(discord.ui.Modal):
         self.add_item(self.f_components)
         self.add_item(self.f_task)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        incidents = parse_status(self.session.raw)
-        tasks = [t.strip() for t in self.f_task.value.split(',') if t.strip()]
-        if not tasks:
-            await interaction.response.send_message("❌ At least one task is required.", ephemeral=True)
-            return
-
-        new_inc = {
-            'date': self.existing['date'] if self.existing else datetime.now().strftime("%b %d, %Y"),
-            'type': self.f_type.value.upper().strip(),
+        async def on_submit(self, interaction: discord.Interaction):
+        posts = parse_blog(self.session.raw)
+        
+        # Parse content blocks with multi-line support
+        content_blocks = []
+        lines = self.f_content.value.split('\n')
+        i = 0
+        current_block_type = None
+        current_block_lines = []
+        
+        def flush_block():
+            nonlocal current_block_type, current_block_lines
+            if current_block_type and (current_block_type == 'divider' or current_block_lines):
+                content_blocks.append({
+                    'type': current_block_type,
+                    'data': '\n'.join(current_block_lines) if current_block_type != 'divider' else ''
+                })
+        
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if stripped.startswith('BLOCK:'):
+                flush_block()
+                current_block_type = stripped.replace('BLOCK:', '').strip()
+                current_block_lines = []
+                if current_block_type == 'divider':
+                    flush_block()
+                    current_block_type = None
+            elif current_block_type:
+                current_block_lines.append(line)
+            i += 1
+        
+        flush_block()
+        
+        new_post = {
+            'id': self.f_id.value.strip().lower().replace(' ', '-'),
             'title': self.f_title.value.strip(),
-            'severity': self.f_severity.value.lower().strip(),
-            'components': self.f_components.value.strip(),
-            'tasks': tasks,
-            'updates': self.existing.get('updates', []) if self.existing else []
+            'subheading': self.f_subheading.value.strip(),
+            'date': self.f_date.value.strip(),
+            'author': self.f_author.value.strip(),
+            'category': self.f_category.value.strip().lower(),
+            'featureImage': self.f_image.value.strip(),
+            'content': content_blocks
         }
-
+        
         if self.existing:
-            for i, inc in enumerate(incidents):
-                if inc.get('date') == self.existing['date'] and inc.get('title') == self.existing.get('title'):
-                    incidents[i] = new_inc
+            for i, p in enumerate(posts):
+                if p['id'] == self.existing['id']:
+                    posts[i] = new_post
                     break
         else:
-            incidents.insert(0, new_inc)
-
-        self.session.raw = format_status(incidents)
+            posts.insert(0, new_post)
+        
+        self.session.raw = format_blog(posts)
         self.session.selected_index = None
         await interaction.response.edit_message(embed=build_embed(self.session), view=build_view(self.session))
 
@@ -1115,6 +1155,8 @@ class ActionDropdown(discord.ui.Select):
         action = self.values[0]
         if action == "add_incident":
             await interaction.response.send_modal(IncidentModal(self.session))
+        elif action == "direct_entry":
+            await interaction.response.send_modal(RawPasteModal(self.session))
         elif action == "add_version":
             await interaction.response.send_modal(VersionModal(self.session))
         elif action == "add_member":
@@ -1303,6 +1345,7 @@ class ChangelogView(discord.ui.View):
         sessions.pop(self.session.author.id, None)
         await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
 
+        
 class BlogView(discord.ui.View):
     def __init__(self, session: Session):
         super().__init__(timeout=600)
@@ -1311,6 +1354,7 @@ class BlogView(discord.ui.View):
             ("➕ New Post",     "add_post"),
             ("✏️ Edit Post",    "edit"),
             ("🗑️ Delete Post",  "delete"),
+            ("📝 Direct Entry", "direct_entry"),
             ("💾 Save",         "save"),
             ("↩️ Cancel",       "cancel"),
         ]))
@@ -1344,6 +1388,11 @@ class BlogView(discord.ui.View):
         view.add_item(back_button)
         await interaction.response.edit_message(embed=build_embed(self.session), view=view)
 
+    @discord.ui.button(label="📝 Direct Entry", style=discord.ButtonStyle.secondary, row=1)
+    async def direct_entry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Opens the RawPasteModal for direct text entry."""
+        await interaction.response.send_modal(RawPasteModal(self.session))
+
     @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
     async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
@@ -1360,6 +1409,67 @@ class BlogView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         sessions.pop(self.session.author.id, None)
         await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
+class RawPasteModal(discord.ui.Modal):
+    """Modal for pasting raw blog post text directly (same format as exported from web editor)."""
+    def __init__(self, session: Session):
+        super().__init__(title="Direct Blog Entry — Paste Raw Text")
+        self.session = session
+        
+        self.f_raw = discord.ui.TextInput(
+            label="Paste the complete blog entry here",
+            placeholder="ID: my-post\nTITLE: My Post\nDATE: 2026-05-01\nAUTHOR: Johan\nCATEGORY: general\nCONTENT_START\nBLOCK: paragraph\nYour content here...\nCONTENT_END",
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+            required=True
+        )
+        self.add_item(self.f_raw)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_text = self.f_raw.value.strip()
+        
+        if not raw_text:
+            await interaction.response.send_message("❌ Please paste the blog entry text.", ephemeral=True)
+            return
+        
+        # Parse the pasted text into a post
+        try:
+            posts = parse_blog(raw_text)
+            if not posts:
+                await interaction.response.send_message("❌ Could not parse a valid blog post. Check the format.", ephemeral=True)
+                return
+            
+            new_post = posts[0]  # Take the first parsed post
+            
+            # Get existing posts
+            existing_posts = parse_blog(self.session.raw)
+            
+            # Check if this ID already exists
+            existing_idx = None
+            for i, p in enumerate(existing_posts):
+                if p['id'] == new_post['id']:
+                    existing_idx = i
+                    break
+            
+            if existing_idx is not None:
+                # Replace existing
+                existing_posts[existing_idx] = new_post
+                action = "updated"
+            else:
+                # Add as new (at the top)
+                existing_posts.insert(0, new_post)
+                action = "added"
+            
+            self.session.raw = format_blog(existing_posts)
+            self.session.selected_index = None
+            
+            embed = build_embed(self.session)
+            embed.set_footer(text=f"✅ Post '{new_post['title']}' {action} successfully!")
+            await interaction.response.edit_message(embed=embed, view=build_view(self.session))
+            
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error parsing entry: {str(e)}", ephemeral=True)
+
 
 class TeamView(discord.ui.View):
     def __init__(self, session: Session):
