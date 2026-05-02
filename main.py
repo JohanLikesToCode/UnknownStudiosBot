@@ -498,32 +498,58 @@ async def verify_webhook_message(msg_id: str) -> bool:
 def _incident_key(inc: Dict) -> str:
     return f"{inc['date']}|{inc.get('title','')}"
 
+def _is_resolved(inc: Dict) -> bool:
+    """Return True if the incident's last update status is RESOLVED or COMPLETED."""
+    updates = inc.get('updates', [])
+    if not updates:
+        return False
+    last_status = updates[-1].get('status', '').upper()
+    return last_status in ('RESOLVED', 'COMPLETED')
+
 async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
-    """Post/edit/delete webhook messages so they mirror the current status.txt."""
+    """Post/edit/delete webhook messages so they mirror the current status.txt.
+
+    Rules:
+    - Oldest incidents post first so newest appears at the bottom of the channel.
+    - If a message already exists for an incident, always update it (even if resolved).
+    - If no message exists yet AND the incident is already resolved, skip it —
+      no point resurfacing old closed incidents just because the message was deleted.
+    - If no message exists and the incident is active, post it fresh.
+    """
     ids = await load_webhook_ids()
     new_ids: dict = {}
 
-    for inc in incidents:
+    # Reverse so we post oldest first → newest ends up at bottom of channel
+    ordered = list(reversed(incidents))
+
+    for inc in ordered:
         if inc.get('no_incidents') or not inc.get('title'):
             continue
         key = _incident_key(inc)
         existing_id = ids.get(key)
 
         if existing_id:
+            # Message already tracked — update it if still alive
             alive = await verify_webhook_message(existing_id)
             if alive:
                 result_id = await post_or_update_webhook(inc, existing_id)
                 new_ids[key] = result_id or existing_id
             else:
+                # Message was manually deleted.
+                # Only repost if the incident is still active (not resolved).
+                if not _is_resolved(inc):
+                    result_id = await post_or_update_webhook(inc, None)
+                    if result_id:
+                        new_ids[key] = result_id
+                # If resolved + deleted: just drop it from tracking, don't repost.
+        else:
+            # Never seen before — only post if not already resolved
+            if not _is_resolved(inc):
                 result_id = await post_or_update_webhook(inc, None)
                 if result_id:
                     new_ids[key] = result_id
-        else:
-            result_id = await post_or_update_webhook(inc, None)
-            if result_id:
-                new_ids[key] = result_id
 
-    # Remove messages for incidents that no longer exist in the file
+    # Remove webhook messages for incidents deleted from the file entirely
     for key, msg_id in ids.items():
         if key not in new_ids:
             await delete_webhook_message(msg_id)
