@@ -69,9 +69,17 @@ SEVERITY_EMOJIS = {
     'maintenance': '🔧'
 }
 
-SEVERITY_OPTIONS = ['low', 'medium', 'high', 'critical', 'maintenance']
-STATUS_OPTIONS = ['INVESTIGATING', 'MONITORING', 'IDENTIFIED', 'RESOLVED', 'SCHEDULED', 'IN PROGRESS', 'COMPLETED']
-COMPONENT_OPTIONS = ['Seshy RuntimeEngine', 'Seshy AI', 'Seshy API', 'Seshy Dashboard', 'Seshy Docs', 'Seshy Auth']
+COMPONENT_OPTIONS = [
+    'Seshy RuntimeEngine', 
+    'Seshy AI', 
+    'Seshy API', 
+    'Seshy Dashboard', 
+    'Seshy Docs', 
+    'Seshy Auth',
+    'Seshy Database',
+    'Seshy CDN',
+    'Seshy Gateway'
+]
 
 # ─── Discord Bot Setup ────────────────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -83,6 +91,7 @@ class DiscordBot(commands.Bot):
         super().__init__(command_prefix='!', intents=intents)
         self._status_hash: str = ""
         self._processing = False
+        self._initialized = False
 
     async def setup_hook(self):
         try:
@@ -101,6 +110,14 @@ class DiscordBot(commands.Bot):
 
     async def on_ready(self):
         print(f'{self.user} has connected to Discord!')
+        # Don't sync on startup - only sync when status actually changes
+        if not self._initialized:
+            # Just load the initial hash, don't sync
+            raw = await get_file_content(STATUS_FILE)
+            if raw:
+                self._status_hash = hashlib.sha256(raw.encode()).hexdigest()
+            self._initialized = True
+            print("Bot initialized - monitoring for status changes")
 
 bot = DiscordBot()
 
@@ -336,7 +353,7 @@ def _incident_key(inc: Dict) -> str:
     return f"{inc['date']}|{inc.get('title','')}"
 
 async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
-    """Sync webhook messages with current status - only update, never delete."""
+    """Sync webhook messages with current status - only update existing, create new ones."""
     ids = await load_webhook_ids()
     new_ids = {}
     
@@ -358,10 +375,11 @@ async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
                 if new_id:
                     new_ids[key] = new_id
         else:
-            # Create new message for new incidents
-            new_id = await create_webhook_message(inc)
-            if new_id:
-                new_ids[key] = new_id
+            # Only create new messages for incidents with updates
+            if inc.get('updates'):
+                new_id = await create_webhook_message(inc)
+                if new_id:
+                    new_ids[key] = new_id
     
     # Remove tracking for deleted incidents
     for key, msg_id in ids.items():
@@ -386,10 +404,10 @@ async def poll_status():
             return
         
         print(f"[poll_status] status.txt changed — syncing webhooks")
-        bot._status_hash = new_hash
         bot._processing = True
         incidents = parse_status(raw)
         await sync_webhooks(incidents, "auto-poll")
+        bot._status_hash = new_hash
         bot._processing = False
     except Exception as e:
         print(f"[poll_status] error: {e}")
@@ -421,7 +439,8 @@ class StatusPaginationView(discord.ui.View):
         
         # Add pagination buttons
         incidents = parse_status(session.raw)
-        total_pages = max(1, (len(incidents) + session.items_per_page - 1) // session.items_per_page)
+        active_incidents = [i for i in incidents if not i.get('no_incidents') and i.get('title')]
+        total_pages = max(1, (len(active_incidents) + session.items_per_page - 1) // session.items_per_page)
         
         if total_pages > 1:
             prev_btn = discord.ui.Button(label="◀️ Previous", style=discord.ButtonStyle.secondary, row=1)
@@ -607,9 +626,14 @@ class ActionDropdown(discord.ui.Select):
                     break
             
             self.session.raw = format_status(incidents)
+            
+            embed = build_status_embed(self.session)
+            embed.color = 0xFF0000
+            embed.set_footer(text=f"✅ Deleted: {target_inc.get('title')}")
+            
             await inter.response.edit_message(
-                content=f"✅ Deleted: {target_inc.get('title')}",
-                view=None
+                embed=embed,
+                view=StatusPaginationView(self.session)
             )
         
         select.callback = delete_callback
@@ -668,30 +692,57 @@ class TitleModal(discord.ui.Modal):
         
         async def severity_callback(inter: discord.Interaction):
             self.incident['severity'] = select.values[0]
-            await inter.response.send_modal(ComponentsModal(self.session, self.incident))
+            
+            # Step 3: Select components (multi-select)
+            await inter.response.send_message(
+                "Step 3: Select affected components:",
+                view=ComponentsSelectView(self.session, self.incident),
+                ephemeral=True
+            )
         
         select.callback = severity_callback
         view.add_item(select)
         await interaction.response.send_message("Step 2: Select severity:", view=view, ephemeral=True)
 
-class ComponentsModal(discord.ui.Modal):
+class ComponentsSelectView(discord.ui.View):
     def __init__(self, session: Session, incident: Dict):
-        super().__init__(title="Step 3: Components")
+        super().__init__(timeout=120)
         self.session = session
         self.incident = incident
+        self.selected_components = []
         
-        self.components_input = discord.ui.TextInput(
-            label="Components (comma-separated)",
-            placeholder="Seshy RuntimeEngine, Seshy AI",
-            max_length=200,
-            required=True
+        # Add multi-select for components
+        options = [
+            discord.SelectOption(label=comp, value=comp)
+            for comp in COMPONENT_OPTIONS
+        ]
+        
+        self.component_select = discord.ui.Select(
+            placeholder="Select components (can select multiple)...",
+            min_values=1,
+            max_values=len(COMPONENT_OPTIONS),
+            options=options
         )
-        self.add_item(self.components_input)
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        self.incident['components'] = self.components_input.value.strip()
+        self.component_select.callback = self.on_component_select
+        self.add_item(self.component_select)
         
-        # Step 4: Initial update (required)
+        # Add confirm button
+        confirm_btn = discord.ui.Button(label="✅ Confirm Components", style=discord.ButtonStyle.success, row=1)
+        confirm_btn.callback = self.confirm_components
+        self.add_item(confirm_btn)
+    
+    async def on_component_select(self, interaction: discord.Interaction):
+        self.selected_components = self.component_select.values
+        await interaction.response.defer()
+    
+    async def confirm_components(self, interaction: discord.Interaction):
+        if not self.selected_components:
+            await interaction.response.send_message("Please select at least one component!", ephemeral=True)
+            return
+        
+        self.incident['components'] = ', '.join(self.selected_components)
+        
+        # Step 4: Initial update
         await interaction.response.send_modal(InitialUpdateModal(self.session, self.incident))
 
 class InitialUpdateModal(discord.ui.Modal):
@@ -771,32 +822,57 @@ class EditIncidentModal(discord.ui.Modal):
         async def severity_callback(inter: discord.Interaction):
             self.incident['severity'] = select.values[0]
             
-            # Update components
-            await inter.response.send_modal(EditComponentsModal(
-                self.session, self.incident, inter
-            ))
+            # Pre-select current components
+            current_comps = [c.strip() for c in self.incident.get('components', '').split(',') if c.strip()]
+            await inter.response.send_message(
+                "Select components:",
+                view=EditComponentsView(self.session, self.incident, current_comps),
+                ephemeral=True
+            )
         
         select.callback = severity_callback
         view.add_item(select)
         await interaction.response.send_message("Select severity:", view=view, ephemeral=True)
 
-class EditComponentsModal(discord.ui.Modal):
-    def __init__(self, session: Session, incident: Dict, interaction: discord.Interaction):
-        super().__init__(title="Edit Components")
+class EditComponentsView(discord.ui.View):
+    def __init__(self, session: Session, incident: Dict, current_comps: List[str]):
+        super().__init__(timeout=120)
         self.session = session
         self.incident = incident
-        self.original_interaction = interaction
+        self.selected_components = current_comps
         
-        self.components_input = discord.ui.TextInput(
-            label="Components (comma-separated)",
-            default=incident.get('components', ''),
-            max_length=200,
-            required=True
+        options = [
+            discord.SelectOption(
+                label=comp,
+                value=comp,
+                default=comp in current_comps
+            )
+            for comp in COMPONENT_OPTIONS
+        ]
+        
+        self.component_select = discord.ui.Select(
+            placeholder="Select components (can select multiple)...",
+            min_values=1,
+            max_values=len(COMPONENT_OPTIONS),
+            options=options
         )
-        self.add_item(self.components_input)
+        self.component_select.callback = self.on_component_select
+        self.add_item(self.component_select)
+        
+        confirm_btn = discord.ui.Button(label="✅ Confirm Edit", style=discord.ButtonStyle.success, row=1)
+        confirm_btn.callback = self.confirm_edit
+        self.add_item(confirm_btn)
     
-    async def on_submit(self, interaction: discord.Interaction):
-        self.incident['components'] = self.components_input.value.strip()
+    async def on_component_select(self, interaction: discord.Interaction):
+        self.selected_components = self.component_select.values
+        await interaction.response.defer()
+    
+    async def confirm_edit(self, interaction: discord.Interaction):
+        if not self.selected_components:
+            await interaction.response.send_message("Please select at least one component!", ephemeral=True)
+            return
+        
+        self.incident['components'] = ', '.join(self.selected_components)
         
         # Update the raw content
         incidents = parse_status(self.session.raw)
