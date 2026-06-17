@@ -18,8 +18,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 import aiohttp
 import base64
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 import re
 from github import Github, Auth
 
@@ -68,8 +67,6 @@ SEVERITY_EMOJIS = {
     'critical': '🔴'
 }
 
-SEVERITY_OPTIONS = ['low', 'medium', 'high', 'critical']
-
 COMPONENT_OPTIONS = [
     'Seshy RuntimeEngine', 
     'Seshy Modules', 
@@ -108,12 +105,21 @@ class DiscordBot(commands.Bot):
 
     async def on_ready(self):
         print(f'{self.user} has connected to Discord!')
-        # Don't sync on startup - only sync when status actually changes
         if not self._initialized:
-            # Just load the initial hash, don't sync
             raw = await get_file_content(STATUS_FILE)
             if raw:
                 self._status_hash = hashlib.sha256(raw.encode()).hexdigest()
+                # On startup, only sync active (non-resolved) incidents
+                # This prevents re-posting old resolved incidents
+                incidents = parse_status(raw)
+                active_incidents = [
+                    inc for inc in incidents 
+                    if not inc.get('no_incidents') and inc.get('title') and inc.get('updates')
+                    and inc['updates'][-1].get('status', '').upper() not in ('RESOLVED', 'COMPLETED')
+                ]
+                if active_incidents:
+                    print(f"Found {len(active_incidents)} active incidents on startup")
+                    await sync_webhooks(incidents, "startup-sync")
             self._initialized = True
             print("Bot initialized - monitoring for status changes")
 
@@ -348,16 +354,17 @@ async def delete_webhook_message(msg_id: str):
         await session.delete(f"{STATUS_WEBHOOK}/messages/{msg_id}")
 
 def _incident_key(inc: Dict) -> str:
-    # Use date, type, and title to create a unique key
     inc_type = inc.get('type', 'INCIDENT')
     title = inc.get('title', '')
     return f"{inc['date']}|{inc_type}|{title}"
 
 async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
-    """Sync webhook messages with current status - only update existing, create new ones."""
+    """Sync webhook messages - update existing ones, only create if truly new.
+    Resolved incidents are kept in channel but removed from tracking."""
     ids = await load_webhook_ids()
     new_ids = {}
     
+    # First pass: update or create messages for current incidents
     for inc in incidents:
         if inc.get('no_incidents') or not inc.get('title'):
             continue
@@ -365,39 +372,54 @@ async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
         key = _incident_key(inc)
         existing_id = ids.get(key)
         
+        # Check if this incident is resolved
+        updates = inc.get('updates', [])
+        is_resolved = False
+        if updates:
+            last_status = updates[-1].get('status', '').upper()
+            is_resolved = last_status in ('RESOLVED', 'COMPLETED')
+        
         if existing_id:
-            # Update existing message
-            success = await update_webhook_message(existing_id, inc)
-            if success:
-                new_ids[key] = existing_id
+            if is_resolved:
+                # Update the message one final time, but don't track it anymore
+                await update_webhook_message(existing_id, inc)
+                print(f"Final update for resolved incident: {key} - removed from tracking")
+                # Don't add to new_ids - this removes it from tracking
             else:
-                # Message was deleted, create new one
-                if inc.get('updates'):
-                    new_id = await create_webhook_message(inc)
-                    if new_id:
-                        new_ids[key] = new_id
+                # Update the existing message and keep tracking
+                success = await update_webhook_message(existing_id, inc)
+                if success:
+                    new_ids[key] = existing_id
+                    print(f"Updated existing message {existing_id} for: {key}")
+                else:
+                    # Update failed (message deleted), create new one
+                    if inc.get('updates'):
+                        new_id = await create_webhook_message(inc)
+                        if new_id:
+                            new_ids[key] = new_id
+                            print(f"Recreated message {new_id} for: {key}")
         else:
-            # Only create new messages for incidents with updates
-            # AND only if they don't already have a message
-            if inc.get('updates'):
+            # No existing ID - this is a brand new incident
+            if inc.get('updates') and not is_resolved:
                 new_id = await create_webhook_message(inc)
                 if new_id:
                     new_ids[key] = new_id
+                    print(f"Created new message {new_id} for: {key}")
+            elif inc.get('updates') and is_resolved:
+                # New incident that's already resolved - post once and don't track
+                new_id = await create_webhook_message(inc)
+                if new_id:
+                    print(f"Posted resolved incident: {key} - not tracking")
     
-    # Only delete messages for incidents that were removed from the file
-    # Don't delete messages for incidents that just moved position
+    # Second pass: clean up tracking for incidents that no longer exist
+    current_keys = set(new_ids.keys())
     for key, msg_id in ids.items():
-        if key not in new_ids:
-            # Check if this incident still exists somewhere in the file
-            still_exists = any(
-                _incident_key(inc) == key 
-                for inc in incidents 
-                if not inc.get('no_incidents') and inc.get('title')
-            )
-            if not still_exists:
-                await delete_webhook_message(msg_id)
+        if key not in current_keys:
+            # Don't delete the message, just remove from tracking
+            print(f"Removed from tracking (message kept in channel): {key}")
     
     await save_webhook_ids(new_ids, author)
+    print(f"Tracking {len(new_ids)} active webhook messages")
 
 # ─── Background Poller ────────────────────────────────────────────────────────
 @tasks.loop(seconds=POLL_INTERVAL)
@@ -445,10 +467,8 @@ class StatusPaginationView(discord.ui.View):
         super().__init__(timeout=600)
         self.session = session
         
-        # Add action dropdown
         self.add_item(ActionDropdown(session))
         
-        # Add pagination buttons
         incidents = parse_status(session.raw)
         active_incidents = [i for i in incidents if not i.get('no_incidents') and i.get('title')]
         total_pages = max(1, (len(active_incidents) + session.items_per_page - 1) // session.items_per_page)
@@ -531,21 +551,15 @@ class ActionDropdown(discord.ui.Select):
             await self.save_and_sync(interaction)
     
     async def start_incident_creation(self, interaction: discord.Interaction, inc_type: str):
-        """Start the step-by-step incident creation."""
-        incidents = parse_status(self.session.raw)
-        
-        # Create basic incident structure
         new_inc = {
             'date': datetime.now().strftime('%b %-d, %Y'),
             'type': inc_type,
             'title': '',
-            'severity': 'medium',
+            'severity': 'medium' if inc_type == 'INCIDENT' else 'maintenance',
             'components': '',
             'updates': [],
             'no_incidents': False,
         }
-        
-        # Step 1: Get title
         await interaction.response.send_modal(TitleModal(self.session, new_inc))
     
     async def select_incident_for_edit(self, interaction: discord.Interaction):
@@ -600,7 +614,35 @@ class ActionDropdown(discord.ui.Select):
         async def update_callback(inter: discord.Interaction):
             idx = int(select.values[0])
             target_inc = active_incidents[idx]
-            await inter.response.send_modal(AddUpdateModal(self.session, target_inc))
+            # Show status selector directly
+            view2 = discord.ui.View(timeout=60)
+            status_select = discord.ui.Select(
+                placeholder="Select status for this update...",
+                options=[
+                    discord.SelectOption(label="Investigating", value="INVESTIGATING", emoji="🔴"),
+                    discord.SelectOption(label="Monitoring", value="MONITORING", emoji="🟡"),
+                    discord.SelectOption(label="Identified", value="IDENTIFIED", emoji="🟠"),
+                    discord.SelectOption(label="Resolved", value="RESOLVED", emoji="🟢"),
+                    discord.SelectOption(label="Scheduled", value="SCHEDULED", emoji="📅"),
+                    discord.SelectOption(label="In Progress", value="IN PROGRESS", emoji="⚙️"),
+                    discord.SelectOption(label="Completed", value="COMPLETED", emoji="✅"),
+                    discord.SelectOption(label="Maintenance", value="MAINTENANCE", emoji="🔧"),
+                ]
+            )
+            
+            async def status_callback(inter2: discord.Interaction):
+                selected_status = status_select.values[0]
+                await inter2.response.send_modal(
+                    UpdateDescriptionModal(self.session, target_inc, selected_status)
+                )
+            
+            status_select.callback = status_callback
+            view2.add_item(status_select)
+            await inter.response.send_message(
+                "Select status for this update:", 
+                view=view2, 
+                ephemeral=True
+            )
         
         select.callback = update_callback
         view.add_item(select)
@@ -630,7 +672,6 @@ class ActionDropdown(discord.ui.Select):
             idx = int(select.values[0])
             target_inc = active_incidents[idx]
             
-            # Remove the incident
             for i, inc in enumerate(incidents):
                 if inc.get('date') == target_inc['date'] and inc.get('title') == target_inc.get('title'):
                     incidents.pop(i)
@@ -654,23 +695,20 @@ class ActionDropdown(discord.ui.Select):
     async def save_and_sync(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         
-        # Save to GitHub first
         ok = await commit_file(STATUS_FILE, self.session.raw, "Update status", str(self.session.author))
         
         if not ok:
             await interaction.followup.send("❌ Failed to save to GitHub! Check token.", ephemeral=True)
             return
         
-        # Update hash to prevent poller from re-triggering
         bot._status_hash = hashlib.sha256(self.session.raw.encode()).hexdigest()
         
-        # Sync webhooks
         incidents = parse_status(self.session.raw)
         await sync_webhooks(incidents, str(self.session.author))
         
         await interaction.followup.send("✅ Saved to GitHub and synced to webhook!", ephemeral=True)
 
-# ─── Modals for Step-by-Step Creation ────────────────────────────────────────
+# ─── Modals ───────────────────────────────────────────────────────────────────
 class TitleModal(discord.ui.Modal):
     def __init__(self, session: Session, incident: Dict):
         super().__init__(title="Step 1: Incident Title")
@@ -679,7 +717,7 @@ class TitleModal(discord.ui.Modal):
         
         self.title_input = discord.ui.TextInput(
             label="Title",
-            placeholder="Brief description of the incident",
+            placeholder="Brief description",
             max_length=100,
             required=True
         )
@@ -702,8 +740,6 @@ class TitleModal(discord.ui.Modal):
         
         async def severity_callback(inter: discord.Interaction):
             self.incident['severity'] = select.values[0]
-            
-            # Step 3: Select components (multi-select)
             await inter.response.send_message(
                 "Step 3: Select affected components:",
                 view=ComponentsSelectView(self.session, self.incident),
@@ -721,7 +757,6 @@ class ComponentsSelectView(discord.ui.View):
         self.incident = incident
         self.selected_components = []
         
-        # Add multi-select for components
         options = [
             discord.SelectOption(label=comp, value=comp)
             for comp in COMPONENT_OPTIONS
@@ -736,7 +771,6 @@ class ComponentsSelectView(discord.ui.View):
         self.component_select.callback = self.on_component_select
         self.add_item(self.component_select)
         
-        # Add confirm button
         confirm_btn = discord.ui.Button(label="✅ Confirm Components", style=discord.ButtonStyle.success, row=1)
         confirm_btn.callback = self.confirm_components
         self.add_item(confirm_btn)
@@ -752,14 +786,44 @@ class ComponentsSelectView(discord.ui.View):
         
         self.incident['components'] = ', '.join(self.selected_components)
         
-        # Step 4: Initial update
-        await interaction.response.send_modal(InitialUpdateModal(self.session, self.incident))
+        # Step 4: Initial update - ask status first
+        view = discord.ui.View(timeout=60)
+        default_status = 'SCHEDULED' if self.incident.get('type') == 'MAINTENANCE' else 'INVESTIGATING'
+        
+        status_select = discord.ui.Select(
+            placeholder=f"Select status (default: {default_status})...",
+            options=[
+                discord.SelectOption(label="Investigating", value="INVESTIGATING", emoji="🔴"),
+                discord.SelectOption(label="Monitoring", value="MONITORING", emoji="🟡"),
+                discord.SelectOption(label="Identified", value="IDENTIFIED", emoji="🟠"),
+                discord.SelectOption(label="Resolved", value="RESOLVED", emoji="🟢"),
+                discord.SelectOption(label="Scheduled", value="SCHEDULED", emoji="📅"),
+                discord.SelectOption(label="In Progress", value="IN PROGRESS", emoji="⚙️"),
+                discord.SelectOption(label="Completed", value="COMPLETED", emoji="✅"),
+                discord.SelectOption(label="Maintenance", value="MAINTENANCE", emoji="🔧"),
+            ]
+        )
+        
+        async def status_callback(inter: discord.Interaction):
+            selected_status = status_select.values[0]
+            await inter.response.send_modal(
+                InitialUpdateModal(self.session, self.incident, selected_status)
+            )
+        
+        status_select.callback = status_callback
+        view.add_item(status_select)
+        await interaction.response.send_message(
+            "Step 4: Select initial status:", 
+            view=view, 
+            ephemeral=True
+        )
 
 class InitialUpdateModal(discord.ui.Modal):
-    def __init__(self, session: Session, incident: Dict):
-        super().__init__(title="Step 4: Initial Update")
+    def __init__(self, session: Session, incident: Dict, status: str):
+        super().__init__(title="Step 5: Description")
         self.session = session
         self.incident = incident
+        self.status = status
         
         self.description = discord.ui.TextInput(
             label="Description",
@@ -771,25 +835,19 @@ class InitialUpdateModal(discord.ui.Modal):
         self.add_item(self.description)
     
     async def on_submit(self, interaction: discord.Interaction):
-        # For maintenance, use SCHEDULED as default status instead of INVESTIGATING
-        default_status = 'SCHEDULED' if self.incident.get('type') == 'MAINTENANCE' else 'INVESTIGATING'
-        
         ts = datetime.now().strftime('%b %-d, %H:%M')
         self.incident['updates'].append({
             'timestamp': ts,
-            'status': default_status,
+            'status': self.status,
             'description': self.description.value.strip(),
         })
         
-        # Add to incidents list
         incidents = parse_status(self.session.raw)
-        # Remove any "no incidents" entry
         incidents = [i for i in incidents if not i.get('no_incidents')]
         incidents.insert(0, self.incident)
         
         self.session.raw = format_status(incidents)
         
-        # Show success and refresh
         embed = build_status_embed(self.session)
         embed.color = 0x57F287
         embed.set_footer(text="✅ Incident created! Use 'Save & Post' to publish.")
@@ -799,7 +857,46 @@ class InitialUpdateModal(discord.ui.Modal):
             view=StatusPaginationView(self.session)
         )
 
-# ─── Edit Incident Modal ──────────────────────────────────────────────────────
+class UpdateDescriptionModal(discord.ui.Modal):
+    def __init__(self, session: Session, incident: Dict, status: str):
+        super().__init__(title="Add Update - Description")
+        self.session = session
+        self.incident = incident
+        self.status = status
+        
+        self.description = discord.ui.TextInput(
+            label="Description",
+            placeholder="What's the current status update?",
+            style=discord.TextStyle.paragraph,
+            max_length=500,
+            required=True
+        )
+        self.add_item(self.description)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        ts = datetime.now().strftime('%b %-d, %H:%M')
+        
+        incidents = parse_status(self.session.raw)
+        for inc in incidents:
+            if inc.get('date') == self.incident['date'] and inc.get('title') == self.incident.get('title'):
+                inc['updates'].append({
+                    'timestamp': ts,
+                    'status': self.status,
+                    'description': self.description.value.strip(),
+                })
+                break
+        
+        self.session.raw = format_status(incidents)
+        
+        embed = build_status_embed(self.session)
+        embed.color = 0x57F287
+        embed.set_footer(text="✅ Update added! Use 'Save & Post' to publish.")
+        
+        await interaction.response.edit_message(
+            embed=embed,
+            view=StatusPaginationView(self.session)
+        )
+
 class EditIncidentModal(discord.ui.Modal):
     def __init__(self, session: Session, incident: Dict):
         super().__init__(title="Edit Incident")
@@ -817,7 +914,6 @@ class EditIncidentModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         self.incident['title'] = self.title_input.value.strip()
         
-        # Select severity
         current_sev = self.incident.get('severity', 'medium')
         view = discord.ui.View(timeout=60)
         select = discord.ui.Select(
@@ -833,7 +929,6 @@ class EditIncidentModal(discord.ui.Modal):
         async def severity_callback(inter: discord.Interaction):
             self.incident['severity'] = select.values[0]
             
-            # Pre-select current components
             current_comps = [c.strip() for c in self.incident.get('components', '').split(',') if c.strip()]
             await inter.response.send_message(
                 "Select components:",
@@ -885,7 +980,6 @@ class EditComponentsView(discord.ui.View):
         
         self.incident['components'] = ', '.join(self.selected_components)
         
-        # Update the raw content
         incidents = parse_status(self.session.raw)
         for i, inc in enumerate(incidents):
             if inc.get('date') == self.incident['date'] and inc.get('title') == self.incident.get('title'):
@@ -903,94 +997,6 @@ class EditComponentsView(discord.ui.View):
             view=StatusPaginationView(self.session)
         )
 
-# ─── Add Update Modal ─────────────────────────────────────────────────────────
-class AddUpdateModal(discord.ui.Modal):
-    def __init__(self, session: Session, incident: Dict):
-        super().__init__(title="Add Update - Step 1: Status")
-        self.session = session
-        self.incident = incident
-        # Empty modal - we just use it as a trigger
-        self.add_item(discord.ui.TextInput(
-            label="Click Submit to select status first",
-            placeholder="This will open the status selector...",
-            required=False,
-            max_length=1,
-            default="."
-        ))
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        # Select status FIRST
-        view = discord.ui.View(timeout=60)
-        select = discord.ui.Select(
-            placeholder="Select status for this update...",
-            options=[
-                discord.SelectOption(label="Investigating", value="INVESTIGATING", emoji="🔴"),
-                discord.SelectOption(label="Monitoring", value="MONITORING", emoji="🟡"),
-                discord.SelectOption(label="Identified", value="IDENTIFIED", emoji="🟠"),
-                discord.SelectOption(label="Resolved", value="RESOLVED", emoji="🟢"),
-                discord.SelectOption(label="Scheduled", value="SCHEDULED", emoji="📅"),
-                discord.SelectOption(label="In Progress", value="IN PROGRESS", emoji="⚙️"),
-                discord.SelectOption(label="Completed", value="COMPLETED", emoji="✅"),
-                discord.SelectOption(label="Maintenance", value="MAINTENANCE", emoji="🔧"),
-            ]
-        )
-        
-        async def status_callback(inter: discord.Interaction):
-            selected_status = select.values[0]
-            # Now ask for description
-            await inter.response.send_modal(UpdateDescriptionModal(
-                self.session, self.incident, selected_status
-            ))
-        
-        select.callback = status_callback
-        view.add_item(select)
-        await interaction.response.send_message(
-            "Step 1: Select the status for this update:", 
-            view=view, 
-            ephemeral=True
-        )
-
-class UpdateDescriptionModal(discord.ui.Modal):
-    def __init__(self, session: Session, incident: Dict, status: str):
-        super().__init__(title="Step 2: Description")
-        self.session = session
-        self.incident = incident
-        self.status = status
-        
-        self.description = discord.ui.TextInput(
-            label="Description",
-            placeholder="What's the current status update?",
-            style=discord.TextStyle.paragraph,
-            max_length=500,
-            required=True
-        )
-        self.add_item(self.description)
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        ts = datetime.now().strftime('%b %-d, %H:%M')
-        
-        # Add update to incident
-        incidents = parse_status(self.session.raw)
-        for inc in incidents:
-            if inc.get('date') == self.incident['date'] and inc.get('title') == self.incident.get('title'):
-                inc['updates'].append({
-                    'timestamp': ts,
-                    'status': self.status,
-                    'description': self.description.value.strip(),
-                })
-                break
-        
-        self.session.raw = format_status(incidents)
-        
-        embed = build_status_embed(self.session)
-        embed.color = 0x57F287
-        embed.set_footer(text="✅ Update added! Use 'Save & Post' to publish.")
-        
-        await interaction.response.edit_message(
-            embed=embed,
-            view=StatusPaginationView(self.session)
-        )
-
 # ─── Status Embed Builder ─────────────────────────────────────────────────────
 def build_status_embed(session: Session) -> discord.Embed:
     incidents = parse_status(session.raw)
@@ -1001,14 +1007,12 @@ def build_status_embed(session: Session) -> discord.Embed:
     )
     embed.set_footer(text=f"Editor: {session.author.display_name}")
     
-    # Filter out "no incidents" entries for display
     active_incidents = [i for i in incidents if not i.get('no_incidents')]
     
     if not active_incidents:
         embed.description = "*No active incidents.*"
         return embed
     
-    # Paginate
     start = session.page * session.items_per_page
     end = start + session.items_per_page
     page_incidents = active_incidents[start:end]
@@ -1029,7 +1033,6 @@ def build_status_embed(session: Session) -> discord.Embed:
             last_status = last.get('status', 'free-text update')
             last_emoji = STATUS_EMOJIS.get(last_status.upper(), '⚪')
         
-        # Truncate title for display
         title = inc.get('title', 'Untitled')
         if len(title) > 60:
             title = title[:57] + "..."
