@@ -65,20 +65,18 @@ SEVERITY_EMOJIS = {
     'low': '🟢', 
     'medium': '🟡', 
     'high': '🟠',
-    'critical': '🔴', 
-    'maintenance': '🔧'
+    'critical': '🔴'
 }
+
+SEVERITY_OPTIONS = ['low', 'medium', 'high', 'critical']
 
 COMPONENT_OPTIONS = [
     'Seshy RuntimeEngine', 
-    'Seshy AI', 
-    'Seshy API', 
-    'Seshy Dashboard', 
-    'Seshy Docs', 
-    'Seshy Auth',
-    'Seshy Database',
-    'Seshy CDN',
-    'Seshy Gateway'
+    'Seshy Modules', 
+    'Seshy Database', 
+    'Seshy AI',
+    'GitHub Data Store',
+    'Website'
 ]
 
 # ─── Discord Bot Setup ────────────────────────────────────────────────────────
@@ -686,7 +684,6 @@ class TitleModal(discord.ui.Modal):
                 discord.SelectOption(label="Medium", value="medium", emoji="🟡"),
                 discord.SelectOption(label="High", value="high", emoji="🟠"),
                 discord.SelectOption(label="Critical", value="critical", emoji="🔴"),
-                discord.SelectOption(label="Maintenance", value="maintenance", emoji="🔧"),
             ]
         )
         
@@ -761,11 +758,13 @@ class InitialUpdateModal(discord.ui.Modal):
         self.add_item(self.description)
     
     async def on_submit(self, interaction: discord.Interaction):
-        # Add initial update with default INVESTIGATING status
+        # For maintenance, use SCHEDULED as default status instead of INVESTIGATING
+        default_status = 'SCHEDULED' if self.incident.get('type') == 'MAINTENANCE' else 'INVESTIGATING'
+        
         ts = datetime.now().strftime('%b %-d, %H:%M')
         self.incident['updates'].append({
             'timestamp': ts,
-            'status': 'INVESTIGATING',
+            'status': default_status,
             'description': self.description.value.strip(),
         })
         
@@ -815,7 +814,6 @@ class EditIncidentModal(discord.ui.Modal):
                 discord.SelectOption(label="Medium", value="medium", emoji="🟡"),
                 discord.SelectOption(label="High", value="high", emoji="🟠"),
                 discord.SelectOption(label="Critical", value="critical", emoji="🔴"),
-                discord.SelectOption(label="Maintenance", value="maintenance", emoji="🔧"),
             ]
         )
         
@@ -921,6 +919,7 @@ class AddUpdateModal(discord.ui.Modal):
                 discord.SelectOption(label="Scheduled", value="SCHEDULED", emoji="📅"),
                 discord.SelectOption(label="In Progress", value="IN PROGRESS", emoji="⚙️"),
                 discord.SelectOption(label="Completed", value="COMPLETED", emoji="✅"),
+                discord.SelectOption(label="Maintenance", value="MAINTENANCE", emoji="🔧"),
             ]
         )
         
