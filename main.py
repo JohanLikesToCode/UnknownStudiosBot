@@ -26,7 +26,6 @@ from github import Github, Auth
 print("Starting bot initialization...")
 print(f"Python version: {sys.version}")
 
-# ─── Configuration ────────────────────────────────────────────────────────────
 DISCORD_TOKEN  = os.getenv('DISCORD_TOKEN')
 GITHUB_TOKEN   = os.getenv('GITHUB_TOKEN')
 GITHUB_REPO    = os.getenv('GITHUB_REPO')
@@ -35,7 +34,7 @@ STATUS_WEBHOOK = "https://discord.com/api/webhooks/1499369589296070688/2BEPyenbk
 ROLE_PING      = "<@&1499369803708633148>"
 ALLOWED_ROLE_ID = 1444271393570160680
 
-POLL_INTERVAL = 60  # seconds between status.txt checks
+POLL_INTERVAL = 60
 
 print(f"Discord token present: {bool(DISCORD_TOKEN)}")
 print(f"GitHub token present:  {bool(GITHUB_TOKEN)}")
@@ -45,14 +44,12 @@ if not DISCORD_TOKEN:
     print("ERROR: DISCORD_TOKEN not set!")
     sys.exit(1)
 
-# ─── File paths ───────────────────────────────────────────────────────────────
 STATUS_FILE      = "status.txt"
 CHANGELOG_FILE   = "changelog.txt"
 TEAM_FILE        = "teams.json"
 BLOG_FILE        = "blogs.txt"
 WEBHOOK_IDS_FILE = "webhook_message_ids.json"
 
-# ─── Severity / status visuals ───────────────────────────────────────────────
 STATUS_EMOJIS = {
     "INVESTIGATING": "🔴",
     "MONITORING":    "🟡",
@@ -72,7 +69,6 @@ SEV_EMOJI = {
     'critical': '🔴', 'maintenance': '🔧'
 }
 
-# ─── Discord Bot Setup ────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -80,7 +76,7 @@ intents.guilds = True
 class DiscordBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=intents)
-        self._status_hash: str = ""  # tracks last-seen hash of status.txt
+        self._status_hash: str = ""
 
     async def setup_hook(self):
         try:
@@ -103,7 +99,6 @@ class DiscordBot(commands.Bot):
 
 bot = DiscordBot()
 
-# ─── GitHub Client ────────────────────────────────────────────────────────────
 try:
     if GITHUB_TOKEN and GITHUB_REPO:
         auth = Auth.Token(GITHUB_TOKEN)
@@ -119,7 +114,6 @@ except Exception as e:
     github_client = None
     repo = None
 
-# ─── GitHub Helpers ───────────────────────────────────────────────────────────
 async def get_file_content(file_path: str) -> str:
     if not repo:
         return ""
@@ -144,49 +138,30 @@ async def commit_file(file_path: str, content: str, commit_message: str, author:
         print(f"GitHub commit error: {e}")
         return False
 
-# ─── Status Parsing ───────────────────────────────────────────────────────────
-# Format (exact):
-#
-# May 2, 2026
-# INCIDENT: Title here
-# SEVERITY: high
-# COMPONENTS: Comp A, Comp B
-# May 2, 12:40 Free-text update without a status word (no leading " - STATUS - ")
-# May 2, 14:00 - RESOLVED - Fixed it.
-#
-# OR just:
-# Apr 24, 2025
-# No incidents reported.
-
 _DATE_HEADER = re.compile(
     r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}$'
 )
-# Structured update:  "Apr 30, 02:00 - INVESTIGATING - text"
 _UPDATE_STRUCTURED = re.compile(
     r'^(\w{3}\s+\d{1,2},\s+\d{2}:\d{2})\s+-\s+(\w[\w ]*?)\s+-\s+(.+)$'
 )
-# Bare update:        "May 2, 12:40 Free text"
 _UPDATE_BARE = re.compile(
     r'^(\w{3}\s+\d{1,2},\s+\d{2}:\d{2})\s+(.+)$'
 )
 
 
 def parse_status(content: str) -> List[Dict]:
-    """Parse status.txt into a list of incident dicts."""
     incidents: List[Dict] = []
     current: Optional[Dict] = None
 
     for raw_line in content.split('\n'):
         line = raw_line.rstrip()
 
-        # Blank line → flush current block
         if not line:
             if current is not None:
                 incidents.append(current)
                 current = None
             continue
 
-        # Date header
         if _DATE_HEADER.match(line):
             if current is not None:
                 incidents.append(current)
@@ -204,31 +179,26 @@ def parse_status(content: str) -> List[Dict]:
         if current is None:
             continue
 
-        # No incidents
         if line.strip().lower() == 'no incidents reported.':
             current['no_incidents'] = True
             continue
 
-        # Type + title
         m = re.match(r'^(INCIDENT|MAINTENANCE):\s+(.+)$', line)
         if m:
             current['type'] = m.group(1)
             current['title'] = m.group(2)
             continue
 
-        # Severity
         m = re.match(r'^SEVERITY:\s+(.+)$', line)
         if m:
             current['severity'] = m.group(1).strip().lower()
             continue
 
-        # Components
         m = re.match(r'^COMPONENTS:\s+(.+)$', line)
         if m:
             current['components'] = m.group(1).strip()
             continue
 
-        # Structured update line: "Apr 30, 02:00 - STATUS - description"
         m = _UPDATE_STRUCTURED.match(line)
         if m:
             current['updates'].append({
@@ -238,17 +208,15 @@ def parse_status(content: str) -> List[Dict]:
             })
             continue
 
-        # Bare update line: "May 2, 12:40 description text"
         m = _UPDATE_BARE.match(line)
         if m:
             current['updates'].append({
                 'timestamp': m.group(1).strip(),
-                'status': '',          # no explicit status word
+                'status': '',
                 'description': m.group(2).strip(),
             })
             continue
 
-    # Don't forget the last block (no trailing blank line)
     if current is not None:
         incidents.append(current)
 
@@ -256,7 +224,6 @@ def parse_status(content: str) -> List[Dict]:
 
 
 def format_status(incidents: List[Dict]) -> str:
-    """Serialise parsed incidents back to the canonical text format."""
     blocks = []
     for inc in incidents:
         lines = [inc['date']]
@@ -278,7 +245,6 @@ def format_status(incidents: List[Dict]) -> str:
     return '\n\n'.join(blocks) + '\n'
 
 
-# ─── Changelog Parsing ────────────────────────────────────────────────────────
 def parse_changelog(content: str) -> List[Dict]:
     versions = []
     current = None
@@ -315,7 +281,6 @@ def format_changelog(versions: List[Dict]) -> str:
         lines.append("")
     return '\n'.join(lines)
 
-# ─── Team Parsing ─────────────────────────────────────────────────────────────
 def parse_team(content: str) -> Dict:
     try:
         return json.loads(content)
@@ -325,7 +290,6 @@ def parse_team(content: str) -> Dict:
 def format_team(data: Dict) -> str:
     return json.dumps(data, indent=2)
 
-# ─── Blog Parsing ─────────────────────────────────────────────────────────────
 def parse_blog(content: str) -> List[Dict]:
     posts = []
     blocks_raw = content.split("\n=====================================\n")
@@ -402,7 +366,6 @@ def format_blog(posts: List[Dict]) -> str:
             lines.append("\n=====================================\n")
     return '\n'.join(lines)
 
-# ─── Webhook Message ID Tracking ─────────────────────────────────────────────
 async def load_webhook_ids() -> dict:
     content = await get_file_content(WEBHOOK_IDS_FILE)
     if content:
@@ -416,7 +379,6 @@ async def save_webhook_ids(ids: dict, author: str = "bot") -> bool:
     return await commit_file(WEBHOOK_IDS_FILE, json.dumps(ids, indent=2),
                              "Update webhook message IDs", author)
 
-# ─── Webhook Formatting ───────────────────────────────────────────────────────
 def format_webhook_message(incident: Dict) -> str:
     inc_type = incident.get('type', 'INCIDENT')
     title    = incident.get('title', 'Unknown Incident')
@@ -440,7 +402,6 @@ def format_webhook_message(incident: Dict) -> str:
             stat = u.get('status', '').upper()
             desc = u.get('description', '')
 
-            # Convert "Apr 30, 02:00" → Discord timestamp if possible
             if ts and not ts.startswith('<t:'):
                 for fmt in ('%b %d, %H:%M', '%b  %d, %H:%M'):
                     try:
@@ -455,7 +416,6 @@ def format_webhook_message(incident: Dict) -> str:
                 lines.append(f"{ts} — {stat_emoji} **{stat}**")
                 lines.append(f"> {desc}")
             else:
-                # Bare update — no status word
                 lines.append(f"{ts}")
                 lines.append(f"> {desc}")
             lines.append("")
@@ -499,7 +459,6 @@ def _incident_key(inc: Dict) -> str:
     return f"{inc['date']}|{inc.get('title','')}"
 
 def _is_resolved(inc: Dict) -> bool:
-    """Return True if the incident's last update status is RESOLVED or COMPLETED."""
     updates = inc.get('updates', [])
     if not updates:
         return False
@@ -507,19 +466,9 @@ def _is_resolved(inc: Dict) -> bool:
     return last_status in ('RESOLVED', 'COMPLETED')
 
 async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
-    """Post/edit/delete webhook messages so they mirror the current status.txt.
-
-    Rules:
-    - Oldest incidents post first so newest appears at the bottom of the channel.
-    - If a message already exists for an incident, always update it (even if resolved).
-    - If no message exists yet AND the incident is already resolved, skip it —
-      no point resurfacing old closed incidents just because the message was deleted.
-    - If no message exists and the incident is active, post it fresh.
-    """
     ids = await load_webhook_ids()
     new_ids: dict = {}
 
-    # Reverse so we post oldest first → newest ends up at bottom of channel
     ordered = list(reversed(incidents))
 
     for inc in ordered:
@@ -529,44 +478,36 @@ async def sync_webhooks(incidents: List[Dict], author: str = "bot"):
         existing_id = ids.get(key)
 
         if existing_id:
-            # Message already tracked — update it if still alive
             alive = await verify_webhook_message(existing_id)
             if alive:
                 result_id = await post_or_update_webhook(inc, existing_id)
                 new_ids[key] = result_id or existing_id
             else:
-                # Message was manually deleted.
-                # Only repost if the incident is still active (not resolved).
                 if not _is_resolved(inc):
                     result_id = await post_or_update_webhook(inc, None)
                     if result_id:
                         new_ids[key] = result_id
-                # If resolved + deleted: just drop it from tracking, don't repost.
         else:
-            # Never seen before — only post if not already resolved
             if not _is_resolved(inc):
                 result_id = await post_or_update_webhook(inc, None)
                 if result_id:
                     new_ids[key] = result_id
 
-    # Remove webhook messages for incidents deleted from the file entirely
     for key, msg_id in ids.items():
         if key not in new_ids:
             await delete_webhook_message(msg_id)
 
     await save_webhook_ids(new_ids, author)
 
-# ─── Background Poller ────────────────────────────────────────────────────────
 @tasks.loop(seconds=POLL_INTERVAL)
 async def poll_status():
-    """Periodically fetch status.txt from GitHub and sync webhooks if changed."""
     try:
         raw = await get_file_content(STATUS_FILE)
         if not raw:
             return
         new_hash = hashlib.sha256(raw.encode()).hexdigest()
         if new_hash == bot._status_hash:
-            return  # nothing changed
+            return
         print(f"[poll_status] status.txt changed — syncing webhooks")
         bot._status_hash = new_hash
         incidents = parse_status(raw)
@@ -578,7 +519,6 @@ async def poll_status():
 async def before_poll():
     await bot.wait_until_ready()
 
-# ─── Session State ────────────────────────────────────────────────────────────
 class ContentType(Enum):
     STATUS    = "status"
     CHANGELOG = "changelog"
@@ -596,7 +536,6 @@ class Session:
 
 sessions: Dict[int, Session] = {}
 
-# ─── Embed Builders ───────────────────────────────────────────────────────────
 def build_status_embed(session: Session) -> discord.Embed:
     incidents = parse_status(session.raw)
     embed = discord.Embed(title="🛠️ Status Editor", color=0x5865F2)
@@ -698,163 +637,322 @@ def build_embed(session: Session) -> discord.Embed:
     elif session.content_type == ContentType.BLOG:
         return build_blog_embed(session)
 
-# ─── Select Item Dropdown ─────────────────────────────────────────────────────
-class SelectItemDropdown(discord.ui.Select):
-    def __init__(self, session: Session, action: str):
-        self.session = session
-        self.action  = action
-        options = self._build_options()
+class IncidentTypeSelect(discord.ui.Select):
+    def __init__(self):
         super().__init__(
-            placeholder=f"Select item to {action}…",
-            min_values=1, max_values=1,
-            options=options or [discord.SelectOption(label="— empty —", value="__none__")]
+            placeholder="Incident or Maintenance?",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="🚨 Incident", value="INCIDENT", description="Something is broken"),
+                discord.SelectOption(label="🔧 Maintenance", value="MAINTENANCE", description="Planned maintenance"),
+            ],
+            row=0
         )
 
-    def _build_options(self):
-        opts = []
-        if self.session.content_type == ContentType.STATUS:
-            for i, inc in enumerate(parse_status(self.session.raw)):
-                if not inc.get('no_incidents') and inc.get('title'):
-                    emoji = INCIDENT_EMOJIS.get(inc.get('type', 'INCIDENT'), '🚨')
-                    opts.append(discord.SelectOption(
-                        label=f"[{i+1}] {inc.get('title','Untitled')[:80]}", value=str(i), emoji=emoji))
-        elif self.session.content_type == ContentType.CHANGELOG:
-            for i, v in enumerate(parse_changelog(self.session.raw)):
-                opts.append(discord.SelectOption(
-                    label=f"v{v['version']} — {v.get('date','?')}", value=str(i), emoji='📋'))
-        elif self.session.content_type == ContentType.TEAM:
-            for i, m in enumerate(parse_team(self.session.raw).get('members', [])):
-                opts.append(discord.SelectOption(
-                    label=f"{m.get('name','?')} (@{m.get('handle','?')})", value=str(i), emoji='👤'))
-        elif self.session.content_type == ContentType.BLOG:
-            for i, p in enumerate(parse_blog(self.session.raw)):
-                opts.append(discord.SelectOption(label=f"{p['title'][:80]}", value=str(i), emoji='📝'))
-        return opts
+    async def callback(self, interaction: discord.Interaction):
+        session = sessions.get(interaction.user.id)
+        if not session:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+        await interaction.response.send_modal(IncidentModal(session, incident_type=self.values[0]))
+
+
+class SeveritySelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select severity",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="🟢 Low", value="low"),
+                discord.SelectOption(label="🟡 Medium", value="medium"),
+                discord.SelectOption(label="🟠 High", value="high"),
+                discord.SelectOption(label="🔴 Critical", value="critical"),
+                discord.SelectOption(label="🔧 Maintenance", value="maintenance"),
+            ],
+            row=1
+        )
 
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "__none__":
-            await interaction.response.defer()
+        pass
+
+
+class StatusActionView(discord.ui.View):
+    def __init__(self, session: Session):
+        super().__init__(timeout=600)
+        self.session = session
+
+        self.add_item(IncidentTypeSelect())
+
+        has_incidents = any(not inc.get('no_incidents') and inc.get('title') for inc in parse_status(session.raw))
+
+        add_update_btn = discord.ui.Button(label="📝 Add Update", style=discord.ButtonStyle.primary, row=2, disabled=not has_incidents)
+        add_update_btn.callback = self.add_update_callback
+        self.add_item(add_update_btn)
+
+        edit_btn = discord.ui.Button(label="✏️ Edit Incident", style=discord.ButtonStyle.primary, row=2, disabled=not has_incidents)
+        edit_btn.callback = self.edit_incident_callback
+        self.add_item(edit_btn)
+
+        delete_btn = discord.ui.Button(label="🗑️ Delete Incident", style=discord.ButtonStyle.danger, row=2, disabled=not has_incidents)
+        delete_btn.callback = self.delete_incident_callback
+        self.add_item(delete_btn)
+
+        save_btn = discord.ui.Button(label="💾 Save & Post", style=discord.ButtonStyle.success, row=3)
+        save_btn.callback = self.save_callback
+        self.add_item(save_btn)
+
+        cancel_btn = discord.ui.Button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=3)
+        cancel_btn.callback = self.cancel_callback
+        self.add_item(cancel_btn)
+
+    async def add_update_callback(self, interaction: discord.Interaction):
+        incidents = [inc for inc in parse_status(self.session.raw) if not inc.get('no_incidents') and inc.get('title')]
+        if not incidents:
+            await interaction.response.send_message("No incidents to update.", ephemeral=True)
             return
-        self.session.selected_index = int(self.values[0])
-        if self.action == "edit":
-            await launch_edit_modal(interaction, self.session)
-        elif self.action == "delete":
-            await do_delete(interaction, self.session)
-        elif self.action == "add_update":
-            await launch_update_modal(interaction, self.session)
+
+        if len(incidents) == 1:
+            self.session.selected_index = 0
+            await interaction.response.send_modal(UpdateModal(self.session, incidents[0]))
+            return
+
+        view = discord.ui.View(timeout=60)
+        select = IncidentSelect(incidents, "add_update")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def edit_incident_callback(self, interaction: discord.Interaction):
+        incidents = [inc for inc in parse_status(self.session.raw) if not inc.get('no_incidents') and inc.get('title')]
+        if not incidents:
+            await interaction.response.send_message("No incidents to edit.", ephemeral=True)
+            return
+
+        if len(incidents) == 1:
+            self.session.selected_index = 0
+            await interaction.response.send_modal(IncidentModal(self.session, existing=incidents[0]))
+            return
+
+        view = discord.ui.View(timeout=60)
+        select = IncidentSelect(incidents, "edit")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def delete_incident_callback(self, interaction: discord.Interaction):
+        incidents = [inc for inc in parse_status(self.session.raw) if not inc.get('no_incidents') and inc.get('title')]
+        if not incidents:
+            await interaction.response.send_message("No incidents to delete.", ephemeral=True)
+            return
+
+        if len(incidents) == 1:
+            self.session.selected_index = 0
+            await self._confirm_delete(interaction, incidents[0])
+            return
+
+        view = discord.ui.View(timeout=60)
+        select = IncidentSelect(incidents, "delete")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def _confirm_delete(self, interaction: discord.Interaction, incident: Dict):
+        view = discord.ui.View(timeout=30)
+        confirm = discord.ui.Button(label="✅ Yes, delete it", style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+        async def confirm_cb(inter: discord.Interaction):
+            incidents = parse_status(self.session.raw)
+            for i, inc in enumerate(incidents):
+                if inc.get('date') == incident['date'] and inc.get('title') == incident.get('title'):
+                    incidents.pop(i)
+                    break
+            self.session.raw = format_status(incidents)
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=StatusActionView(self.session))
+
+        async def cancel_cb(inter: discord.Interaction):
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=StatusActionView(self.session))
+
+        confirm.callback = confirm_cb
+        cancel_btn.callback = cancel_cb
+        view.add_item(confirm)
+        view.add_item(cancel_btn)
+
+        embed = discord.Embed(title="⚠️ Confirm Delete", description=f"Delete incident: **{incident['title']}**?", color=0xFF0000)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    async def save_callback(self, interaction: discord.Interaction):
+        incidents = parse_status(self.session.raw)
+        active = [inc for inc in incidents if not inc.get('no_incidents') and inc.get('title')]
+
+        for inc in active:
+            if not inc.get('updates'):
+                await interaction.response.send_message(
+                    f"❌ Incident \"{inc['title']}\" has no updates. Add at least one update before saving.",
+                    ephemeral=True
+                )
+                return
+
+        await interaction.response.defer()
+        ok = await commit_file(self.session.file_path, self.session.raw,
+                               "Update status", str(self.session.author))
+        if ok:
+            await sync_webhooks(incidents, str(self.session.author))
+            bot._status_hash = hashlib.sha256(self.session.raw.encode()).hexdigest()
+            embed = build_embed(self.session)
+            embed.color = 0x57F287
+            embed.set_footer(text="✅ Saved to GitHub & webhook synced!")
+            await interaction.edit_original_response(embed=embed, view=StatusActionView(self.session))
         else:
-            await interaction.response.edit_message(
-                embed=build_embed(self.session), view=build_view(self.session))
+            await interaction.followup.send("❌ Failed to save!", ephemeral=True)
 
-async def launch_edit_modal(interaction: discord.Interaction, session: Session):
-    if session.content_type == ContentType.STATUS:
-        inc = parse_status(session.raw)[session.selected_index]
-        await interaction.response.send_modal(IncidentModal(session, inc))
-    elif session.content_type == ContentType.CHANGELOG:
-        ver = parse_changelog(session.raw)[session.selected_index]
-        await interaction.response.send_modal(VersionModal(session, ver))
-    elif session.content_type == ContentType.TEAM:
-        member = parse_team(session.raw)['members'][session.selected_index]
-        await interaction.response.send_modal(MemberModal(session, member))
-    elif session.content_type == ContentType.BLOG:
-        post = parse_blog(session.raw)[session.selected_index]
-        await interaction.response.send_modal(BlogPostModal(session, post))
+    async def cancel_callback(self, interaction: discord.Interaction):
+        sessions.pop(self.session.author.id, None)
+        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
 
-async def launch_update_modal(interaction: discord.Interaction, session: Session):
-    inc = parse_status(session.raw)[session.selected_index]
-    await interaction.response.send_modal(UpdateModal(session, inc))
+    async def on_timeout(self):
+        sessions.pop(self.session.author.id, None)
 
-async def do_delete(interaction: discord.Interaction, session: Session):
-    idx = session.selected_index
-    if session.content_type == ContentType.STATUS:
-        items = parse_status(session.raw)
-        items.pop(idx)
-        session.raw = format_status(items)
-    elif session.content_type == ContentType.CHANGELOG:
-        items = parse_changelog(session.raw)
-        items.pop(idx)
-        session.raw = format_changelog(items)
-    elif session.content_type == ContentType.TEAM:
-        team = parse_team(session.raw)
-        team['members'].pop(idx)
-        session.raw = format_team(team)
-    elif session.content_type == ContentType.BLOG:
-        items = parse_blog(session.raw)
-        items.pop(idx)
-        session.raw = format_blog(items)
-    session.selected_index = None
-    await interaction.response.edit_message(
-        embed=build_embed(session), view=build_view(session))
 
-# ─── Modals ───────────────────────────────────────────────────────────────────
+class IncidentSelect(discord.ui.Select):
+    def __init__(self, incidents: List[Dict], action: str):
+        self.incidents = incidents
+        self.action = action
+        options = []
+        for i, inc in enumerate(incidents):
+            emoji = INCIDENT_EMOJIS.get(inc.get('type', 'INCIDENT'), '🚨')
+            label = inc.get('title', 'Untitled')[:80]
+            options.append(discord.SelectOption(label=f"{label}", value=str(i), emoji=emoji, description=inc.get('date', '')))
+        super().__init__(placeholder=f"Select incident to {action}…", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        session = sessions.get(interaction.user.id)
+        if not session:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+        idx = int(self.values[0])
+        session.selected_index = idx
+        incident = self.incidents[idx]
+
+        if self.action == "add_update":
+            await interaction.response.send_modal(UpdateModal(session, incident))
+        elif self.action == "edit":
+            await interaction.response.send_modal(IncidentModal(session, existing=incident))
+        elif self.action == "delete":
+            await self._confirm_delete(interaction, session, incident)
+
+    async def _confirm_delete(self, interaction: discord.Interaction, session: Session, incident: Dict):
+        view = discord.ui.View(timeout=30)
+        confirm = discord.ui.Button(label="✅ Yes, delete it", style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+        async def confirm_cb(inter: discord.Interaction):
+            incidents = parse_status(session.raw)
+            for i, inc in enumerate(incidents):
+                if inc.get('date') == incident['date'] and inc.get('title') == incident.get('title'):
+                    incidents.pop(i)
+                    break
+            session.raw = format_status(incidents)
+            session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(session), view=StatusActionView(session))
+
+        async def cancel_cb(inter: discord.Interaction):
+            session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(session), view=StatusActionView(session))
+
+        confirm.callback = confirm_cb
+        cancel_btn.callback = cancel_cb
+        view.add_item(confirm)
+        view.add_item(cancel_btn)
+
+        embed = discord.Embed(title="⚠️ Confirm Delete", description=f"Delete incident: **{incident['title']}**?", color=0xFF0000)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
 class IncidentModal(discord.ui.Modal):
-    def __init__(self, session: Session, existing: Optional[Dict] = None):
+    def __init__(self, session: Session, existing: Optional[Dict] = None, incident_type: str = "INCIDENT"):
         super().__init__(title="Edit Incident" if existing else "New Incident")
         self.session  = session
         self.existing = existing
 
-        self.f_type = discord.ui.TextInput(
-            label="Type", placeholder="INCIDENT or MAINTENANCE",
-            default=existing.get('type', 'INCIDENT') if existing else 'INCIDENT', max_length=20)
         self.f_title = discord.ui.TextInput(
-            label="Title", placeholder="Brief description",
-            default=existing.get('title', '') if existing else '', max_length=100)
-        self.f_severity = discord.ui.TextInput(
-            label="Severity", placeholder="low / medium / high / critical / maintenance",
-            default=existing.get('severity', 'medium') if existing else 'medium', max_length=20)
-        self.f_components = discord.ui.TextInput(
-            label="Components (comma-separated)", placeholder="Seshy RuntimeEngine, Seshy AI",
-            default=existing.get('components', '') if existing else '', max_length=200, required=False)
-
-        self.add_item(self.f_type)
+            label="Title",
+            placeholder="Brief description of the issue",
+            default=existing.get('title', '') if existing else '',
+            max_length=100
+        )
         self.add_item(self.f_title)
-        self.add_item(self.f_severity)
-        self.add_item(self.f_components)
+
+        self.incident_type = incident_type if not existing else existing.get('type', 'INCIDENT')
+
+        if not existing:
+            self.f_severity = discord.ui.TextInput(
+                label="Severity",
+                placeholder="low / medium / high / critical / maintenance",
+                default='medium',
+                max_length=20
+            )
+            self.add_item(self.f_severity)
+
+            self.f_components = discord.ui.TextInput(
+                label="Components (comma-separated)",
+                placeholder="Seshy RuntimeEngine, Seshy AI",
+                default='',
+                max_length=200,
+                required=False
+            )
+            self.add_item(self.f_components)
 
     async def on_submit(self, interaction: discord.Interaction):
         incidents = parse_status(self.session.raw)
-        new_inc = {
-            'date':       self.existing['date'] if self.existing else datetime.now().strftime('%b %-d, %Y'),
-            'type':       self.f_type.value.strip().upper(),
-            'title':      self.f_title.value.strip(),
-            'severity':   self.f_severity.value.strip().lower(),
-            'components': self.f_components.value.strip(),
-            'updates':    self.existing.get('updates', []) if self.existing else [],
-            'no_incidents': False,
-        }
         if self.existing:
             for i, inc in enumerate(incidents):
                 if inc.get('date') == self.existing['date'] and inc.get('title') == self.existing.get('title'):
-                    incidents[i] = new_inc
+                    incidents[i]['title'] = self.f_title.value.strip()
+                    incidents[i]['type'] = self.incident_type
                     break
         else:
+            new_inc = {
+                'date':       datetime.now().strftime('%b %d, %Y'),
+                'type':       self.incident_type,
+                'title':      self.f_title.value.strip(),
+                'severity':   self.f_severity.value.strip().lower() if hasattr(self, 'f_severity') else 'medium',
+                'components': self.f_components.value.strip() if hasattr(self, 'f_components') else '',
+                'updates':    [],
+                'no_incidents': False,
+            }
             incidents.insert(0, new_inc)
         self.session.raw = format_status(incidents)
         self.session.selected_index = None
         await interaction.response.edit_message(
-            embed=build_embed(self.session), view=build_view(self.session))
+            embed=build_embed(self.session), view=StatusActionView(self.session))
 
 
 class UpdateModal(discord.ui.Modal):
     def __init__(self, session: Session, incident: Dict):
-        super().__init__(title="Add Update")
+        super().__init__(title=f"Update: {incident.get('title','')[:40]}")
         self.session  = session
         self.incident = incident
 
         self.f_status = discord.ui.TextInput(
-            label="Status (leave blank for free-text update)",
-            placeholder="INVESTIGATING / MONITORING / IDENTIFIED / RESOLVED",
-            required=False, max_length=30)
+            label="Status",
+            placeholder="INVESTIGATING / MONITORING / IDENTIFIED / RESOLVED / COMPLETED",
+            required=True,
+            max_length=30
+        )
         self.f_desc = discord.ui.TextInput(
-            label="Description", placeholder="What is the current situation?",
-            style=discord.TextStyle.paragraph, max_length=500)
-
+            label="Description",
+            placeholder="What is the current situation?",
+            style=discord.TextStyle.paragraph,
+            max_length=500
+        )
         self.add_item(self.f_status)
         self.add_item(self.f_desc)
 
     async def on_submit(self, interaction: discord.Interaction):
         incidents = parse_status(self.session.raw)
-        ts = datetime.now().strftime('%b %-d, %H:%M')
+        ts = datetime.now().strftime('%b %d, %H:%M')
         for inc in incidents:
             if inc.get('date') == self.incident['date'] and inc.get('title') == self.incident.get('title'):
                 inc['updates'].append({
@@ -866,7 +964,149 @@ class UpdateModal(discord.ui.Modal):
         self.session.raw = format_status(incidents)
         self.session.selected_index = None
         await interaction.response.edit_message(
-            embed=build_embed(self.session), view=build_view(self.session))
+            embed=build_embed(self.session), view=StatusActionView(self.session))
+
+
+class ChangelogView(discord.ui.View):
+    def __init__(self, session: Session):
+        super().__init__(timeout=600)
+        self.session = session
+
+    async def on_timeout(self):
+        sessions.pop(self.session.author.id, None)
+
+    @discord.ui.button(label="➕ New Version", style=discord.ButtonStyle.success, row=0)
+    async def add_version(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(VersionModal(self.session))
+
+    @discord.ui.button(label="✏️ Edit Version", style=discord.ButtonStyle.primary, row=0)
+    async def edit_version(self, interaction: discord.Interaction, button: discord.ui.Button):
+        versions = parse_changelog(self.session.raw)
+        if not versions:
+            await interaction.response.send_message("No versions to edit.", ephemeral=True)
+            return
+        if len(versions) == 1:
+            self.session.selected_index = 0
+            await interaction.response.send_modal(VersionModal(self.session, existing=versions[0]))
+            return
+        view = discord.ui.View(timeout=60)
+        select = VersionSelect(versions, "edit")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    @discord.ui.button(label="🗑️ Delete Version", style=discord.ButtonStyle.danger, row=0)
+    async def delete_version(self, interaction: discord.Interaction, button: discord.ui.Button):
+        versions = parse_changelog(self.session.raw)
+        if not versions:
+            await interaction.response.send_message("No versions to delete.", ephemeral=True)
+            return
+        if len(versions) == 1:
+            self.session.selected_index = 0
+            await self._confirm_delete_version(interaction, versions[0])
+            return
+        view = discord.ui.View(timeout=60)
+        select = VersionSelect(versions, "delete")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def _confirm_delete_version(self, interaction: discord.Interaction, version: Dict):
+        view = discord.ui.View(timeout=30)
+        confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+        async def confirm_cb(inter: discord.Interaction):
+            versions = parse_changelog(self.session.raw)
+            for i, v in enumerate(versions):
+                if v['version'] == version['version']:
+                    versions.pop(i)
+                    break
+            self.session.raw = format_changelog(versions)
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=ChangelogView(self.session))
+
+        async def cancel_cb(inter: discord.Interaction):
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=ChangelogView(self.session))
+
+        confirm.callback = confirm_cb
+        cancel_btn.callback = cancel_cb
+        view.add_item(confirm)
+        view.add_item(cancel_btn)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="⚠️ Confirm Delete", description=f"Delete v{version['version']}?", color=0xFF0000),
+            view=view
+        )
+
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=1)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ok = await commit_file(self.session.file_path, self.session.raw, "Update changelog", str(self.session.author))
+        if ok:
+            embed = build_embed(self.session)
+            embed.color = 0x57F287
+            embed.set_footer(text="✅ Saved to GitHub!")
+            await interaction.edit_original_response(embed=embed, view=ChangelogView(self.session))
+        else:
+            await interaction.followup.send("❌ Failed to save!", ephemeral=True)
+
+    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sessions.pop(self.session.author.id, None)
+        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
+
+class VersionSelect(discord.ui.Select):
+    def __init__(self, versions: List[Dict], action: str):
+        self.versions = versions
+        self.action = action
+        options = []
+        for i, v in enumerate(versions):
+            options.append(discord.SelectOption(
+                label=f"v{v['version']}",
+                description=v.get('date', ''),
+                value=str(i),
+                emoji='📋'
+            ))
+        super().__init__(placeholder=f"Select version to {action}…", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        session = sessions.get(interaction.user.id)
+        if not session:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+        idx = int(self.values[0])
+        session.selected_index = idx
+        version = self.versions[idx]
+
+        if self.action == "edit":
+            await interaction.response.send_modal(VersionModal(session, existing=version))
+        elif self.action == "delete":
+            view = discord.ui.View(timeout=30)
+            confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+            cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+            async def confirm_cb(inter: discord.Interaction):
+                versions = parse_changelog(session.raw)
+                for i, v in enumerate(versions):
+                    if v['version'] == version['version']:
+                        versions.pop(i)
+                        break
+                session.raw = format_changelog(versions)
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=ChangelogView(session))
+
+            async def cancel_cb(inter: discord.Interaction):
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=ChangelogView(session))
+
+            confirm.callback = confirm_cb
+            cancel_btn.callback = cancel_cb
+            view.add_item(confirm)
+            view.add_item(cancel_btn)
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Confirm Delete", description=f"Delete v{version['version']}?", color=0xFF0000),
+                view=view
+            )
 
 
 class VersionModal(discord.ui.Modal):
@@ -876,18 +1116,24 @@ class VersionModal(discord.ui.Modal):
         self.existing = existing
 
         self.f_version = discord.ui.TextInput(
-            label="Version", placeholder="1.2.3",
-            default=existing['version'] if existing else '', max_length=30)
+            label="Version",
+            placeholder="1.2.3",
+            default=existing['version'] if existing else '',
+            max_length=30
+        )
         self.f_date = discord.ui.TextInput(
-            label="Date", placeholder="YYYY-MM-DD",
+            label="Date",
+            placeholder="YYYY-MM-DD",
             default=existing.get('date', datetime.now().strftime("%Y-%m-%d")) if existing else datetime.now().strftime("%Y-%m-%d"),
-            max_length=20)
+            max_length=20
+        )
         self.f_entries = discord.ui.TextInput(
             label="Entries (TYPE Description, one per line)",
             placeholder="FEATURE Added dark mode\nFIX Fixed login bug",
             default='\n'.join(f"{e['type']} {e['description']}" for e in existing.get('entries', [])) if existing else '',
-            style=discord.TextStyle.paragraph, max_length=1500)
-
+            style=discord.TextStyle.paragraph,
+            max_length=1500
+        )
         self.add_item(self.f_version)
         self.add_item(self.f_date)
         self.add_item(self.f_entries)
@@ -917,7 +1163,143 @@ class VersionModal(discord.ui.Modal):
         self.session.raw = format_changelog(versions)
         self.session.selected_index = None
         await interaction.response.edit_message(
-            embed=build_embed(self.session), view=build_view(self.session))
+            embed=build_embed(self.session), view=ChangelogView(self.session))
+
+
+class TeamView(discord.ui.View):
+    def __init__(self, session: Session):
+        super().__init__(timeout=600)
+        self.session = session
+
+    async def on_timeout(self):
+        sessions.pop(self.session.author.id, None)
+
+    @discord.ui.button(label="➕ Add Member", style=discord.ButtonStyle.success, row=0)
+    async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(MemberModal(self.session))
+
+    @discord.ui.button(label="✏️ Edit Member", style=discord.ButtonStyle.primary, row=0)
+    async def edit_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        members = parse_team(self.session.raw).get('members', [])
+        if not members:
+            await interaction.response.send_message("No members to edit.", ephemeral=True)
+            return
+        if len(members) == 1:
+            self.session.selected_index = 0
+            await interaction.response.send_modal(MemberModal(self.session, existing=members[0]))
+            return
+        view = discord.ui.View(timeout=60)
+        select = MemberSelect(members, "edit")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    @discord.ui.button(label="🗑️ Remove Member", style=discord.ButtonStyle.danger, row=0)
+    async def remove_member(self, interaction: discord.Interaction, button: discord.ui.Button):
+        members = parse_team(self.session.raw).get('members', [])
+        if not members:
+            await interaction.response.send_message("No members to remove.", ephemeral=True)
+            return
+        if len(members) == 1:
+            self.session.selected_index = 0
+            await self._confirm_remove_member(interaction, members[0])
+            return
+        view = discord.ui.View(timeout=60)
+        select = MemberSelect(members, "delete")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def _confirm_remove_member(self, interaction: discord.Interaction, member: Dict):
+        view = discord.ui.View(timeout=30)
+        confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+        async def confirm_cb(inter: discord.Interaction):
+            team = parse_team(self.session.raw)
+            team['members'] = [m for m in team['members'] if m['id'] != member['id']]
+            self.session.raw = format_team(team)
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=TeamView(self.session))
+
+        async def cancel_cb(inter: discord.Interaction):
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=TeamView(self.session))
+
+        confirm.callback = confirm_cb
+        cancel_btn.callback = cancel_cb
+        view.add_item(confirm)
+        view.add_item(cancel_btn)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="⚠️ Confirm Remove", description=f"Remove {member.get('name','?')}?", color=0xFF0000),
+            view=view
+        )
+
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=1)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ok = await commit_file(self.session.file_path, self.session.raw, "Update team", str(self.session.author))
+        if ok:
+            embed = build_embed(self.session)
+            embed.color = 0x57F287
+            embed.set_footer(text="✅ Saved to GitHub!")
+            await interaction.edit_original_response(embed=embed, view=TeamView(self.session))
+        else:
+            await interaction.followup.send("❌ Failed to save!", ephemeral=True)
+
+    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sessions.pop(self.session.author.id, None)
+        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
+
+class MemberSelect(discord.ui.Select):
+    def __init__(self, members: List[Dict], action: str):
+        self.members = members
+        self.action = action
+        options = []
+        for i, m in enumerate(members):
+            options.append(discord.SelectOption(
+                label=m.get('name', '?')[:80],
+                description=f"@{m.get('handle','?')}",
+                value=str(i),
+                emoji='👤'
+            ))
+        super().__init__(placeholder=f"Select member to {action}…", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        session = sessions.get(interaction.user.id)
+        if not session:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+        idx = int(self.values[0])
+        session.selected_index = idx
+        member = self.members[idx]
+
+        if self.action == "edit":
+            await interaction.response.send_modal(MemberModal(session, existing=member))
+        elif self.action == "delete":
+            view = discord.ui.View(timeout=30)
+            confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+            cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+            async def confirm_cb(inter: discord.Interaction):
+                team = parse_team(session.raw)
+                team['members'] = [m for m in team['members'] if m['id'] != member['id']]
+                session.raw = format_team(team)
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=TeamView(session))
+
+            async def cancel_cb(inter: discord.Interaction):
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=TeamView(session))
+
+            confirm.callback = confirm_cb
+            cancel_btn.callback = cancel_cb
+            view.add_item(confirm)
+            view.add_item(cancel_btn)
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Confirm Remove", description=f"Remove {member.get('name','?')}?", color=0xFF0000),
+                view=view
+            )
 
 
 class MemberModal(discord.ui.Modal):
@@ -927,22 +1309,37 @@ class MemberModal(discord.ui.Modal):
         self.existing = existing
 
         self.f_id = discord.ui.TextInput(
-            label="Member ID (slug)", placeholder="johndoe",
-            default=existing['id'] if existing else '', max_length=30)
+            label="Member ID (slug)",
+            placeholder="johndoe",
+            default=existing['id'] if existing else '',
+            max_length=30
+        )
         self.f_name = discord.ui.TextInput(
-            label="Display Name", placeholder="John Doe",
-            default=existing.get('name', '') if existing else '', max_length=50)
+            label="Display Name",
+            placeholder="John Doe",
+            default=existing.get('name', '') if existing else '',
+            max_length=50
+        )
         self.f_handle = discord.ui.TextInput(
-            label="Discord Handle", placeholder="johndoe",
-            default=existing.get('handle', '') if existing else '', max_length=50)
+            label="Discord Handle",
+            placeholder="johndoe",
+            default=existing.get('handle', '') if existing else '',
+            max_length=50
+        )
         self.f_roles = discord.ui.TextInput(
-            label="Roles (comma-separated)", placeholder="Developer, Support",
-            default=', '.join(existing.get('roles', [])) if existing else '', max_length=200)
+            label="Roles (comma-separated)",
+            placeholder="Developer, Support",
+            default=', '.join(existing.get('roles', [])) if existing else '',
+            max_length=200
+        )
         self.f_about = discord.ui.TextInput(
-            label="About", placeholder="Short bio (optional)",
+            label="About",
+            placeholder="Short bio (optional)",
             default=existing.get('about', '') if existing else '',
-            required=False, style=discord.TextStyle.paragraph, max_length=500)
-
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=500
+        )
         self.add_item(self.f_id)
         self.add_item(self.f_name)
         self.add_item(self.f_handle)
@@ -973,7 +1370,147 @@ class MemberModal(discord.ui.Modal):
         self.session.raw = format_team(team)
         self.session.selected_index = None
         await interaction.response.edit_message(
-            embed=build_embed(self.session), view=build_view(self.session))
+            embed=build_embed(self.session), view=TeamView(self.session))
+
+
+class BlogView(discord.ui.View):
+    def __init__(self, session: Session):
+        super().__init__(timeout=600)
+        self.session = session
+
+    async def on_timeout(self):
+        sessions.pop(self.session.author.id, None)
+
+    @discord.ui.button(label="➕ New Post", style=discord.ButtonStyle.success, row=0)
+    async def add_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(BlogPostModal(self.session))
+
+    @discord.ui.button(label="✏️ Edit Post", style=discord.ButtonStyle.primary, row=0)
+    async def edit_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        posts = parse_blog(self.session.raw)
+        if not posts:
+            await interaction.response.send_message("No posts to edit.", ephemeral=True)
+            return
+        if len(posts) == 1:
+            self.session.selected_index = 0
+            await interaction.response.send_modal(BlogPostModal(self.session, existing=posts[0]))
+            return
+        view = discord.ui.View(timeout=60)
+        select = BlogPostSelect(posts, "edit")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    @discord.ui.button(label="🗑️ Delete Post", style=discord.ButtonStyle.danger, row=0)
+    async def delete_post(self, interaction: discord.Interaction, button: discord.ui.Button):
+        posts = parse_blog(self.session.raw)
+        if not posts:
+            await interaction.response.send_message("No posts to delete.", ephemeral=True)
+            return
+        if len(posts) == 1:
+            self.session.selected_index = 0
+            await self._confirm_delete_post(interaction, posts[0])
+            return
+        view = discord.ui.View(timeout=60)
+        select = BlogPostSelect(posts, "delete")
+        view.add_item(select)
+        await interaction.response.edit_message(embed=build_embed(self.session), view=view)
+
+    async def _confirm_delete_post(self, interaction: discord.Interaction, post: Dict):
+        view = discord.ui.View(timeout=30)
+        confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+        cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+        async def confirm_cb(inter: discord.Interaction):
+            posts = parse_blog(self.session.raw)
+            posts = [p for p in posts if p['id'] != post['id']]
+            self.session.raw = format_blog(posts)
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=BlogView(self.session))
+
+        async def cancel_cb(inter: discord.Interaction):
+            self.session.selected_index = None
+            await inter.response.edit_message(embed=build_embed(self.session), view=BlogView(self.session))
+
+        confirm.callback = confirm_cb
+        cancel_btn.callback = cancel_cb
+        view.add_item(confirm)
+        view.add_item(cancel_btn)
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="⚠️ Confirm Delete", description=f"Delete post '{post['title']}'?", color=0xFF0000),
+            view=view
+        )
+
+    @discord.ui.button(label="📝 Direct Entry", style=discord.ButtonStyle.secondary, row=1)
+    async def direct_entry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RawPasteModal(self.session))
+
+    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=1)
+    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        ok = await commit_file(self.session.file_path, self.session.raw, "Update blog", str(self.session.author))
+        if ok:
+            embed = build_embed(self.session)
+            embed.color = 0x57F287
+            embed.set_footer(text="✅ Saved to GitHub!")
+            await interaction.edit_original_response(embed=embed, view=BlogView(self.session))
+        else:
+            await interaction.followup.send("❌ Failed to save!", ephemeral=True)
+
+    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        sessions.pop(self.session.author.id, None)
+        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
+
+
+class BlogPostSelect(discord.ui.Select):
+    def __init__(self, posts: List[Dict], action: str):
+        self.posts = posts
+        self.action = action
+        options = []
+        for i, p in enumerate(posts):
+            options.append(discord.SelectOption(
+                label=p['title'][:80],
+                description=p.get('date', ''),
+                value=str(i),
+                emoji='📝'
+            ))
+        super().__init__(placeholder=f"Select post to {action}…", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        session = sessions.get(interaction.user.id)
+        if not session:
+            await interaction.response.send_message("Session expired.", ephemeral=True)
+            return
+        idx = int(self.values[0])
+        session.selected_index = idx
+        post = self.posts[idx]
+
+        if self.action == "edit":
+            await interaction.response.send_modal(BlogPostModal(session, existing=post))
+        elif self.action == "delete":
+            view = discord.ui.View(timeout=30)
+            confirm = discord.ui.Button(label="✅ Yes", style=discord.ButtonStyle.danger)
+            cancel_btn = discord.ui.Button(label="❌ No", style=discord.ButtonStyle.secondary)
+
+            async def confirm_cb(inter: discord.Interaction):
+                posts = parse_blog(session.raw)
+                posts = [p for p in posts if p['id'] != post['id']]
+                session.raw = format_blog(posts)
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=BlogView(session))
+
+            async def cancel_cb(inter: discord.Interaction):
+                session.selected_index = None
+                await inter.response.edit_message(embed=build_embed(session), view=BlogView(session))
+
+            confirm.callback = confirm_cb
+            cancel_btn.callback = cancel_cb
+            view.add_item(confirm)
+            view.add_item(cancel_btn)
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="⚠️ Confirm Delete", description=f"Delete post '{post['title']}'?", color=0xFF0000),
+                view=view
+            )
 
 
 class BlogPostModal(discord.ui.Modal):
@@ -983,27 +1520,38 @@ class BlogPostModal(discord.ui.Modal):
         self.existing = existing
 
         self.f_id = discord.ui.TextInput(
-            label="Post ID (slug)", placeholder="my-awesome-post",
-            default=existing['id'] if existing else '', max_length=100)
+            label="Post ID (slug)",
+            placeholder="my-awesome-post",
+            default=existing['id'] if existing else '',
+            max_length=100
+        )
         self.f_title = discord.ui.TextInput(
-            label="Title", placeholder="My Awesome Blog Post",
-            default=existing.get('title', '') if existing else '', max_length=200)
+            label="Title",
+            placeholder="My Awesome Blog Post",
+            default=existing.get('title', '') if existing else '',
+            max_length=200
+        )
         self.f_subheading = discord.ui.TextInput(
-            label="Subheading", placeholder="A brief description",
+            label="Subheading",
+            placeholder="A brief description",
             default=existing.get('subheading', '') if existing else '',
-            required=False, max_length=300)
+            required=False,
+            max_length=300
+        )
         self.f_meta = discord.ui.TextInput(
             label="Date | Author | Category",
             placeholder="2026-05-01 | Johan | announcements",
             default=(f"{existing.get('date','')} | {existing.get('author','')} | {existing.get('category','general')}"
                      if existing else datetime.now().strftime("%Y-%m-%d") + " | Unknown | general"),
-            max_length=100)
+            max_length=100
+        )
         self.f_content = discord.ui.TextInput(
-            label="Content (BLOCK:type\\ndata)",
+            label="Content (BLOCK:type per line, then data)",
             placeholder="BLOCK:paragraph\nWelcome!\nBLOCK:heading\nSection Title",
             default='\n'.join(f"BLOCK:{b['type']}\n{b['data']}" for b in existing.get('content', [])) if existing else '',
-            style=discord.TextStyle.paragraph, max_length=4000)
-
+            style=discord.TextStyle.paragraph,
+            max_length=4000
+        )
         self.add_item(self.f_id)
         self.add_item(self.f_title)
         self.add_item(self.f_subheading)
@@ -1064,7 +1612,7 @@ class BlogPostModal(discord.ui.Modal):
         self.session.raw = format_blog(posts)
         self.session.selected_index = None
         await interaction.response.edit_message(
-            embed=build_embed(self.session), view=build_view(self.session))
+            embed=build_embed(self.session), view=BlogView(self.session))
 
 
 class RawPasteModal(discord.ui.Modal):
@@ -1074,7 +1622,10 @@ class RawPasteModal(discord.ui.Modal):
         self.f_raw = discord.ui.TextInput(
             label="Paste the complete blog entry here",
             placeholder="ID: my-post\nTITLE: My Post\n...",
-            style=discord.TextStyle.paragraph, max_length=4000, required=True)
+            style=discord.TextStyle.paragraph,
+            max_length=4000,
+            required=True
+        )
         self.add_item(self.f_raw)
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -1085,92 +1636,27 @@ class RawPasteModal(discord.ui.Modal):
         try:
             posts = parse_blog(raw_text)
             if not posts:
-                await interaction.response.send_message(
-                    "❌ Could not parse a valid blog post. Check the format.", ephemeral=True)
+                await interaction.response.send_message("❌ Could not parse a valid blog post.", ephemeral=True)
                 return
             new_post = posts[0]
             existing_posts = parse_blog(self.session.raw)
             existing_idx = next((i for i, p in enumerate(existing_posts) if p['id'] == new_post['id']), None)
             if existing_idx is not None:
                 existing_posts[existing_idx] = new_post
-                action = "updated"
             else:
                 existing_posts.insert(0, new_post)
-                action = "added"
             self.session.raw = format_blog(existing_posts)
             self.session.selected_index = None
             embed = build_embed(self.session)
-            embed.set_footer(text=f"✅ Post '{new_post['title']}' {action} successfully!")
-            await interaction.response.edit_message(embed=embed, view=build_view(self.session))
+            embed.set_footer(text=f"✅ Post added successfully!")
+            await interaction.response.edit_message(embed=embed, view=BlogView(self.session))
         except Exception as e:
-            await interaction.response.send_message(f"❌ Error parsing entry: {e}", ephemeral=True)
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
-# ─── Action Dropdown ──────────────────────────────────────────────────────────
-class ActionDropdown(discord.ui.Select):
-    def __init__(self, session: Session, actions: list):
-        self.session = session
-        options = [discord.SelectOption(label=label, value=value) for label, value in actions]
-        super().__init__(placeholder="Choose an action…", min_values=1, max_values=1,
-                         options=options, row=0)
 
-    async def callback(self, interaction: discord.Interaction):
-        action = self.values[0]
-        if action == "add_incident":
-            await interaction.response.send_modal(IncidentModal(self.session))
-        elif action == "add_version":
-            await interaction.response.send_modal(VersionModal(self.session))
-        elif action == "add_member":
-            await interaction.response.send_modal(MemberModal(self.session))
-        elif action == "add_post":
-            await interaction.response.send_modal(BlogPostModal(self.session))
-        elif action == "direct_entry":
-            await interaction.response.send_modal(RawPasteModal(self.session))
-        elif action in ("edit", "delete", "add_update"):
-            view = discord.ui.View(timeout=60)
-            view.add_item(SelectItemDropdown(self.session, action))
-            back = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
-            async def back_cb(inter: discord.Interaction):
-                await inter.response.edit_message(
-                    embed=build_embed(self.session), view=build_view(self.session))
-            back.callback = back_cb
-            view.add_item(back)
-            await interaction.response.edit_message(embed=build_embed(self.session), view=view)
-        elif action == "save_status":
-            await interaction.response.defer()
-            ok = await commit_file(self.session.file_path, self.session.raw,
-                                   "Update status", str(self.session.author))
-            if ok:
-                incidents = parse_status(self.session.raw)
-                await sync_webhooks(incidents, str(self.session.author))
-                # Update hash so poller doesn't re-trigger immediately
-                bot._status_hash = hashlib.sha256(self.session.raw.encode()).hexdigest()
-                embed = build_embed(self.session)
-                embed.color = 0x57F287
-                embed.set_footer(text="✅ Saved to GitHub & webhook synced!")
-                await interaction.edit_original_response(embed=embed, view=build_view(self.session))
-            else:
-                await interaction.followup.send("❌ Failed to save!", ephemeral=True)
-        elif action == "save":
-            await interaction.response.defer()
-            label = {"changelog": "changelog", "team": "team", "blog": "blog"}.get(
-                self.session.content_type.value, "content")
-            ok = await commit_file(self.session.file_path, self.session.raw,
-                                   f"Update {label}", str(self.session.author))
-            if ok:
-                embed = build_embed(self.session)
-                embed.color = 0x57F287
-                embed.set_footer(text="✅ Saved to GitHub!")
-                await interaction.edit_original_response(embed=embed, view=build_view(self.session))
-            else:
-                await interaction.followup.send("❌ Failed to save!", ephemeral=True)
-        elif action == "cancel":
-            sessions.pop(self.session.author.id, None)
-            await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
-
-# ─── Views ────────────────────────────────────────────────────────────────────
 def build_view(session: Session) -> discord.ui.View:
     if session.content_type == ContentType.STATUS:
-        return StatusView(session)
+        return StatusActionView(session)
     elif session.content_type == ContentType.CHANGELOG:
         return ChangelogView(session)
     elif session.content_type == ContentType.TEAM:
@@ -1178,222 +1664,7 @@ def build_view(session: Session) -> discord.ui.View:
     elif session.content_type == ContentType.BLOG:
         return BlogView(session)
 
-def _select_view_with_back(session: Session, action: str, parent_view) -> discord.ui.View:
-    view = discord.ui.View(timeout=600)
-    view.add_item(SelectItemDropdown(session, action))
-    back = discord.ui.Button(label="↩️ Back", style=discord.ButtonStyle.secondary, row=1)
-    async def back_cb(inter: discord.Interaction):
-        await inter.response.edit_message(embed=build_embed(session), view=parent_view)
-    back.callback = back_cb
-    view.add_item(back)
-    return view
 
-class StatusView(discord.ui.View):
-    def __init__(self, session: Session):
-        super().__init__(timeout=600)
-        self.session = session
-        self.add_item(ActionDropdown(session, [
-            ("➕ New Incident",    "add_incident"),
-            ("✏️ Edit Incident",   "edit"),
-            ("📝 Add Update",      "add_update"),
-            ("🗑️ Delete Incident", "delete"),
-            ("💾 Save & Post",     "save_status"),
-            ("↩️ Cancel",          "cancel"),
-        ]))
-
-    async def on_timeout(self):
-        sessions.pop(self.session.author.id, None)
-
-    @discord.ui.button(label="➕ New Incident", style=discord.ButtonStyle.success, row=1)
-    async def add_incident(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(IncidentModal(self.session))
-
-    @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary, row=1)
-    async def edit_incident(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "edit", self))
-
-    @discord.ui.button(label="📝 Add Update", style=discord.ButtonStyle.primary, row=1)
-    async def add_update(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "add_update", self))
-
-    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger, row=1)
-    async def delete_incident(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "delete", self))
-
-    @discord.ui.button(label="💾 Save & Post", style=discord.ButtonStyle.success, row=2)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        ok = await commit_file(self.session.file_path, self.session.raw,
-                               "Update status", str(self.session.author))
-        if ok:
-            incidents = parse_status(self.session.raw)
-            await sync_webhooks(incidents, str(self.session.author))
-            bot._status_hash = hashlib.sha256(self.session.raw.encode()).hexdigest()
-            embed = build_embed(self.session)
-            embed.color = 0x57F287
-            embed.set_footer(text="✅ Saved to GitHub & webhook synced!")
-            await interaction.edit_original_response(embed=embed, view=self)
-        else:
-            await interaction.followup.send("❌ Failed to save! Check GitHub token.", ephemeral=True)
-
-    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        sessions.pop(self.session.author.id, None)
-        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
-
-
-class ChangelogView(discord.ui.View):
-    def __init__(self, session: Session):
-        super().__init__(timeout=600)
-        self.session = session
-        self.add_item(ActionDropdown(session, [
-            ("➕ New Version",    "add_version"),
-            ("✏️ Edit Version",   "edit"),
-            ("🗑️ Delete Version", "delete"),
-            ("💾 Save",           "save"),
-            ("↩️ Cancel",         "cancel"),
-        ]))
-
-    async def on_timeout(self):
-        sessions.pop(self.session.author.id, None)
-
-    @discord.ui.button(label="➕ New Version", style=discord.ButtonStyle.success, row=1)
-    async def add_version(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(VersionModal(self.session))
-
-    @discord.ui.button(label="✏️ Edit Version", style=discord.ButtonStyle.primary, row=1)
-    async def edit_version(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "edit", self))
-
-    @discord.ui.button(label="🗑️ Delete Version", style=discord.ButtonStyle.danger, row=1)
-    async def delete_version(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "delete", self))
-
-    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        ok = await commit_file(self.session.file_path, self.session.raw,
-                               "Update changelog", str(self.session.author))
-        if ok:
-            embed = build_embed(self.session)
-            embed.color = 0x57F287
-            embed.set_footer(text="✅ Saved to GitHub!")
-            await interaction.edit_original_response(embed=embed, view=self)
-        else:
-            await interaction.followup.send("❌ Failed to save! Check GitHub token.", ephemeral=True)
-
-    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        sessions.pop(self.session.author.id, None)
-        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
-
-
-class TeamView(discord.ui.View):
-    def __init__(self, session: Session):
-        super().__init__(timeout=600)
-        self.session = session
-        self.add_item(ActionDropdown(session, [
-            ("➕ Add Member",    "add_member"),
-            ("✏️ Edit Member",   "edit"),
-            ("🗑️ Remove Member", "delete"),
-            ("💾 Save",          "save"),
-            ("↩️ Cancel",        "cancel"),
-        ]))
-
-    async def on_timeout(self):
-        sessions.pop(self.session.author.id, None)
-
-    @discord.ui.button(label="➕ Add Member", style=discord.ButtonStyle.success, row=1)
-    async def add_member(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(MemberModal(self.session))
-
-    @discord.ui.button(label="✏️ Edit Member", style=discord.ButtonStyle.primary, row=1)
-    async def edit_member(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "edit", self))
-
-    @discord.ui.button(label="🗑️ Remove Member", style=discord.ButtonStyle.danger, row=1)
-    async def remove_member(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "delete", self))
-
-    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        ok = await commit_file(self.session.file_path, self.session.raw,
-                               "Update team", str(self.session.author))
-        if ok:
-            embed = build_embed(self.session)
-            embed.color = 0x57F287
-            embed.set_footer(text="✅ Saved to GitHub!")
-            await interaction.edit_original_response(embed=embed, view=self)
-        else:
-            await interaction.followup.send("❌ Failed to save! Check GitHub token.", ephemeral=True)
-
-    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        sessions.pop(self.session.author.id, None)
-        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
-
-
-class BlogView(discord.ui.View):
-    def __init__(self, session: Session):
-        super().__init__(timeout=600)
-        self.session = session
-        self.add_item(ActionDropdown(session, [
-            ("➕ New Post",      "add_post"),
-            ("✏️ Edit Post",     "edit"),
-            ("🗑️ Delete Post",   "delete"),
-            ("📝 Direct Entry",  "direct_entry"),
-            ("💾 Save",          "save"),
-            ("↩️ Cancel",        "cancel"),
-        ]))
-
-    async def on_timeout(self):
-        sessions.pop(self.session.author.id, None)
-
-    @discord.ui.button(label="➕ New Post", style=discord.ButtonStyle.success, row=1)
-    async def add_post(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(BlogPostModal(self.session))
-
-    @discord.ui.button(label="✏️ Edit Post", style=discord.ButtonStyle.primary, row=1)
-    async def edit_post(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "edit", self))
-
-    @discord.ui.button(label="🗑️ Delete Post", style=discord.ButtonStyle.danger, row=1)
-    async def delete_post(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(
-            embed=build_embed(self.session), view=_select_view_with_back(self.session, "delete", self))
-
-    @discord.ui.button(label="📝 Direct Entry", style=discord.ButtonStyle.secondary, row=1)
-    async def direct_entry(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RawPasteModal(self.session))
-
-    @discord.ui.button(label="💾 Save", style=discord.ButtonStyle.success, row=2)
-    async def save(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        ok = await commit_file(self.session.file_path, self.session.raw,
-                               "Update blog", str(self.session.author))
-        if ok:
-            embed = build_embed(self.session)
-            embed.color = 0x57F287
-            embed.set_footer(text="✅ Saved to GitHub!")
-            await interaction.edit_original_response(embed=embed, view=self)
-        else:
-            await interaction.followup.send("❌ Failed to save! Check GitHub token.", ephemeral=True)
-
-    @discord.ui.button(label="↩️ Cancel", style=discord.ButtonStyle.secondary, row=2)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        sessions.pop(self.session.author.id, None)
-        await interaction.response.edit_message(content="*Session cancelled.*", embed=None, view=None)
-
-# ─── Slash Commands ───────────────────────────────────────────────────────────
 def has_permission(member: discord.Member) -> bool:
     return any(role.id == ALLOWED_ROLE_ID for role in member.roles)
 
@@ -1464,18 +1735,15 @@ async def help_editor(interaction: discord.Interaction):
     embed.add_field(name="Commands",
                     value="`/edit <type>` — Open editor\n`/view <type>` — Read-only view\n`/sync_webhooks` — Force re-sync",
                     inline=False)
-    embed.add_field(name="Status file format",
-                    value="```\nMay 2, 2026\nINCIDENT: Title\nSEVERITY: high\nCOMPONENTS: Seshy AI\nMay 2, 12:40 - INVESTIGATING - something broke\nMay 2, 13:00 - RESOLVED - fixed\n```",
+    embed.add_field(name="Status Editing",
+                    value="1. Click dropdown to choose Incident or Maintenance\n2. Fill in title, severity, components\n3. Save creates the incident file\n4. Add an update (required) then Save & Post to push to webhook\n5. Each incident gets ONE message, updated with new info",
                     inline=False)
-    embed.add_field(name="Bare update (no status word)",
-                    value="`May 2, 12:40 Free text description`", inline=False)
     embed.add_field(name="Webhook behaviour",
-                    value="• Each incident → one message in the channel\n• Bot polls GitHub every 60 s — manual edits auto-sync\n• Saving via bot also triggers immediate sync\n• Deleted incidents remove their webhook message",
+                    value="• Incident posts once when first update is added\n• All subsequent updates edit that same message\n• Deleting an incident removes its webhook message\n• Bot auto-syncs every 60 seconds",
                     inline=False)
     embed.set_footer(text="All editor sessions are ephemeral (only visible to you)")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ─── Keep-alive ───────────────────────────────────────────────────────────────
 from flask import Flask
 from threading import Thread
 
