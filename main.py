@@ -53,6 +53,7 @@ DATA_MESSAGE_ID = int(os.getenv('DATA_MESSAGE_ID', '1524278108851798116'))
 
 POLL_INTERVAL = 60
 AUTO_RESOLVE_DAYS = int(os.getenv('AUTO_RESOLVE_DAYS', '50'))
+RECENT_SYNC_DAYS = int(os.getenv('RECENT_SYNC_DAYS', '14'))
 
 print(f"Discord token present: {bool(DISCORD_TOKEN)}")
 print(f"GitHub token present:  {bool(GITHUB_TOKEN)}")
@@ -248,7 +249,8 @@ async def load_data_store():
     try:
         channel = bot.get_channel(DATA_CHANNEL_ID) or await bot.fetch_channel(DATA_CHANNEL_ID)
     except Exception as e:
-        print(f"Cannot access data channel {DATA_CHANNEL_ID}: {e}")
+        print(f"ERROR: Cannot access data channel {DATA_CHANNEL_ID}: {type(e).__name__}: {e}")
+        print("Check the bot has 'View Channel' and 'Read Message History' permissions there.")
         bot._data_message = None
         bot._webhook_ids = {}
         return
@@ -256,7 +258,7 @@ async def load_data_store():
     try:
         msg = await channel.fetch_message(DATA_MESSAGE_ID)
     except Exception as e:
-        print(f"Data message {DATA_MESSAGE_ID} not found ({e}); creating a new one.")
+        print(f"WARNING: Data message {DATA_MESSAGE_ID} not found ({type(e).__name__}: {e}); creating a new one.")
         try:
             msg = await channel.send(
                 "📊 **Status Bot Data Store** — internal use only, do not delete or edit manually.\n"
@@ -558,53 +560,63 @@ async def delete_webhook_message(msg_id: str):
 
 async def sync_webhooks(incidents: List[Dict]):
     """Sync webhook messages - update existing ones, only create if truly new.
-    Tracking is keyed by stable incident ID, so renaming an incident's title
-    no longer creates a duplicate message. Resolved incidents get one final
-    update and are dropped from tracking (message stays in the channel)."""
+    Tracking is keyed by stable incident ID and, critically, is PERMANENT:
+    once an incident has a webhook message, later syncs always PATCH that
+    same message (including its final resolved state) instead of dropping
+    it from tracking. Dropping resolved incidents from tracking was the bug
+    that caused every resolved incident to be re-posted as a duplicate on
+    every subsequent sync. Tracking is only removed when an incident is
+    actually deleted from status.txt via the editor.
+
+    Incidents older than RECENT_SYNC_DAYS that are already resolved and were
+    never tracked (i.e. predate this bot / this tracking system) are left
+    alone entirely - we don't want a routine sync suddenly posting fresh
+    copies of year-old history into the channel.
+    """
     ids = dict(bot._webhook_ids)
-    new_ids: Dict[str, str] = {}
+    new_ids = dict(ids)
+    cutoff = datetime.now() - timedelta(days=RECENT_SYNC_DAYS)
 
     for inc in incidents:
         if inc.get('no_incidents') or not inc.get('title') or not inc.get('id'):
             continue
+        updates = inc.get('updates', [])
+        if not updates:
+            continue
 
         key = inc['id']
         existing_id = ids.get(key)
-
-        updates = inc.get('updates', [])
-        is_resolved = bool(updates) and updates[-1].get('status', '').upper() in ('RESOLVED', 'COMPLETED')
+        is_resolved = updates[-1].get('status', '').upper() in ('RESOLVED', 'COMPLETED')
 
         if existing_id:
-            if is_resolved:
-                await update_webhook_message(existing_id, inc)
-                print(f"Final update for resolved incident {key} - removed from tracking")
+            success = await update_webhook_message(existing_id, inc)
+            if success:
+                print(f"Updated existing message {existing_id} for incident {key}")
             else:
-                success = await update_webhook_message(existing_id, inc)
-                if success:
-                    new_ids[key] = existing_id
-                    print(f"Updated existing message {existing_id} for incident {key}")
-                elif updates:
-                    new_id = await create_webhook_message(inc)
-                    if new_id:
-                        new_ids[key] = new_id
-                        print(f"Recreated message {new_id} for incident {key} (original was deleted)")
-        else:
-            if updates and not is_resolved:
+                # Original message was deleted out-of-band; recreate it.
                 new_id = await create_webhook_message(inc)
                 if new_id:
                     new_ids[key] = new_id
-                    print(f"Created new message {new_id} for incident {key}")
-            elif updates and is_resolved:
-                new_id = await create_webhook_message(inc)
-                if new_id:
-                    print(f"Posted already-resolved incident {key} - not tracking")
+                    print(f"Recreated message {new_id} for incident {key} (original was deleted)")
+        else:
+            if is_resolved:
+                inc_date = _parse_incident_date(inc['date'])
+                if inc_date and inc_date < cutoff:
+                    # Old history that predates tracking - leave it alone.
+                    continue
+            new_id = await create_webhook_message(inc)
+            if new_id:
+                new_ids[key] = new_id
+                print(f"Created new message {new_id} for incident {key}")
 
-    for key in ids:
-        if key not in new_ids:
-            print(f"Removed from tracking (message kept in channel): {key}")
+    current_ids = {inc['id'] for inc in incidents if inc.get('id') and not inc.get('no_incidents')}
+    for key in list(new_ids.keys()):
+        if key not in current_ids:
+            print(f"Dropped tracking for incident removed from status.txt: {key}")
+            del new_ids[key]
 
     await save_webhook_ids(new_ids)
-    print(f"Tracking {len(new_ids)} active webhook message(s)")
+    print(f"Tracking {len(new_ids)} webhook message(s)")
 
 # ─── Background Poller ────────────────────────────────────────────────────────
 @tasks.loop(seconds=POLL_INTERVAL)
