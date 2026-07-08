@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 import aiohttp
 import base64
@@ -52,6 +52,7 @@ DATA_CHANNEL_ID = int(os.getenv('DATA_CHANNEL_ID', '1524277928945258496'))
 DATA_MESSAGE_ID = int(os.getenv('DATA_MESSAGE_ID', '1524278108851798116'))
 
 POLL_INTERVAL = 60
+AUTO_RESOLVE_DAYS = int(os.getenv('AUTO_RESOLVE_DAYS', '50'))
 
 print(f"Discord token present: {bool(DISCORD_TOKEN)}")
 print(f"GitHub token present:  {bool(GITHUB_TOKEN)}")
@@ -171,8 +172,20 @@ class DiscordBot(commands.Bot):
 
             raw = await get_file_content(STATUS_FILE)
             if raw:
-                self._status_hash = hashlib.sha256(raw.encode()).hexdigest()
                 incidents = parse_status(raw)
+
+                if not self._webhook_ids:
+                    migrated = await migrate_legacy_webhook_ids(incidents)
+                    if migrated:
+                        self._webhook_ids = migrated
+                        await save_webhook_ids(migrated)
+
+                if auto_resolve_stale(incidents):
+                    raw = format_status(incidents)
+                    await commit_file(STATUS_FILE, raw, "Auto-resolve stale incidents", "auto-resolver")
+
+                self._status_hash = hashlib.sha256(raw.encode()).hexdigest()
+
                 active_incidents = [
                     inc for inc in incidents
                     if not inc.get('no_incidents') and inc.get('title') and inc.get('updates')
@@ -180,7 +193,7 @@ class DiscordBot(commands.Bot):
                 ]
                 if active_incidents:
                     print(f"Found {len(active_incidents)} active incidents on startup")
-                    await sync_webhooks(incidents)
+                await sync_webhooks(incidents)
             self._initialized = True
             print("Bot initialized - monitoring for status changes")
 
@@ -292,6 +305,36 @@ async def save_webhook_ids(ids: dict) -> bool:
         except Exception as e2:
             print(f"Retry also failed: {e2}")
             return False
+
+LEGACY_WEBHOOK_IDS_FILE = "webhook_message_ids.json"
+
+async def migrate_legacy_webhook_ids(incidents: List[Dict]) -> Dict[str, str]:
+    """One-time migration: the previous version of this bot tracked webhook
+    message IDs in webhook_message_ids.json on GitHub, keyed by
+    'date|type|title'. If the new data message is empty, pull that old file
+    (if it's still there) and remap it onto the new stable incident IDs, so
+    a restart doesn't treat every open incident as brand new and re-post it."""
+    raw = await get_file_content(LEGACY_WEBHOOK_IDS_FILE)
+    if not raw:
+        return {}
+    try:
+        legacy = json.loads(raw)
+    except Exception:
+        return {}
+    if not legacy:
+        return {}
+
+    migrated: Dict[str, str] = {}
+    for inc in incidents:
+        if inc.get('no_incidents') or not inc.get('title') or not inc.get('id'):
+            continue
+        legacy_key = f"{inc['date']}|{inc.get('type','INCIDENT')}|{inc['title']}"
+        if legacy_key in legacy:
+            migrated[inc['id']] = legacy[legacy_key]
+
+    if migrated:
+        print(f"Migrated {len(migrated)} tracked webhook message id(s) from legacy {LEGACY_WEBHOOK_IDS_FILE}")
+    return migrated
 
 # ─── Status Parsing ───────────────────────────────────────────────────────────
 _DATE_HEADER = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}$')
@@ -409,6 +452,43 @@ def format_status(incidents: List[Dict]) -> str:
                     lines.append(f"{ts} {desc}")
         blocks.append('\n'.join(lines))
     return '\n\n'.join(blocks) + '\n'
+
+def _parse_incident_date(date_str: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(date_str, "%b %d, %Y")
+    except ValueError:
+        return None
+
+def auto_resolve_stale(incidents: List[Dict]) -> bool:
+    """Auto-resolve any incident that's been open longer than AUTO_RESOLVE_DAYS
+    days and hasn't already been marked resolved/completed. Mutates incidents
+    in place. Returns True if anything changed (caller should re-save)."""
+    changed = False
+    cutoff = datetime.now() - timedelta(days=AUTO_RESOLVE_DAYS)
+
+    for inc in incidents:
+        if inc.get('no_incidents') or not inc.get('title'):
+            continue
+        updates = inc.get('updates', [])
+        if not updates:
+            continue
+        last_status = updates[-1].get('status', '').upper()
+        if last_status in ('RESOLVED', 'COMPLETED'):
+            continue
+
+        inc_date = _parse_incident_date(inc['date'])
+        if inc_date and inc_date < cutoff:
+            auto_status = 'COMPLETED' if inc.get('type') == 'MAINTENANCE' else 'RESOLVED'
+            updates.append({
+                'timestamp': now_ts_str(),
+                'status': auto_status,
+                'description': f"Automatically marked {auto_status.lower()} after "
+                                f"{AUTO_RESOLVE_DAYS} days with no update.",
+            })
+            changed = True
+            print(f"Auto-resolved stale incident {inc.get('id')}: {inc.get('title')}")
+
+    return changed
 
 # ─── Public Webhook Management (status channel) ───────────────────────────────
 def format_webhook_message(incident: Dict) -> str:
@@ -537,15 +617,20 @@ async def poll_status():
         raw = await get_file_content(STATUS_FILE)
         if not raw:
             return
-        new_hash = hashlib.sha256(raw.encode()).hexdigest()
-        if new_hash == bot._status_hash:
-            return
 
-        print("[poll_status] status.txt changed — syncing webhooks")
         bot._processing = True
         incidents = parse_status(raw)
-        await sync_webhooks(incidents)
-        bot._status_hash = new_hash
+
+        if auto_resolve_stale(incidents):
+            raw = format_status(incidents)
+            await commit_file(STATUS_FILE, raw, "Auto-resolve stale incidents", "auto-resolver")
+
+        new_hash = hashlib.sha256(raw.encode()).hexdigest()
+        if new_hash != bot._status_hash:
+            print("[poll_status] status.txt changed — syncing webhooks")
+            await sync_webhooks(incidents)
+            bot._status_hash = new_hash
+
         bot._processing = False
     except Exception as e:
         print(f"[poll_status] error: {e}")
@@ -657,6 +742,19 @@ class ActionDropdown(discord.ui.Select):
             await self.select_incident(interaction, self.go_to_delete, "delete")
         elif action == "save":
             await self.save_and_sync(interaction)
+
+    async def start_incident_creation(self, interaction: discord.Interaction, inc_type: str):
+        new_inc = {
+            'date': now_date_str(),
+            'id': None,
+            'type': inc_type,
+            'title': '',
+            'severity': 'medium' if inc_type == 'INCIDENT' else 'maintenance',
+            'components': '',
+            'updates': [],
+            'no_incidents': False,
+        }
+        await interaction.response.send_modal(TitleModal(self.session, new_inc))
 
     def _active_incidents(self):
         incidents = parse_status(self.session.raw)
