@@ -3,7 +3,6 @@ import os
 import traceback
 import warnings
 import hashlib
-import secrets
 warnings.filterwarnings('ignore', category=SyntaxWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
@@ -175,6 +174,12 @@ class DiscordBot(commands.Bot):
             if raw:
                 incidents = parse_status(raw)
 
+                if re.search(r'^ID:\s+\S+$', raw, re.MULTILINE):
+                    print("Found legacy ID: lines in status.txt (these break the website's parser) - cleaning up.")
+                    raw = format_status(incidents)
+                    await commit_file(STATUS_FILE, raw, "Remove internal ID lines (website compatibility)", "auto-cleanup")
+                    incidents = parse_status(raw)
+
                 if not self._webhook_ids:
                     migrated = await migrate_legacy_webhook_ids(incidents)
                     if migrated:
@@ -345,10 +350,12 @@ _UPDATE_STRUCTURED = re.compile(r'^(\w{3}\s+\d{1,2},\s+\d{2}:\d{2})\s+-\s+(\w[\w
 _UPDATE_BARE = re.compile(r'^(\w{3}\s+\d{1,2},\s+\d{2}:\d{2})\s+(.+)$')
 
 def _finalize(inc: Optional[Dict]) -> Optional[Dict]:
-    """Ensure a completed incident has a stable ID before it's used anywhere."""
-    if inc and not inc.get('no_incidents') and inc.get('title') and not inc.get('id'):
-        # Deterministic fallback for legacy status.txt entries with no ID line,
-        # so the same incident maps to the same ID across parses.
+    """Derive a stable internal tracking id from date+title. This id is used
+    ONLY inside the bot (webhook tracking) and is never written to
+    status.txt - the public site's JS parser only understands SEVERITY: and
+    COMPONENTS: as metadata lines, so any other line (like an ID: line)
+    corrupts its title parsing. Do not add a line to the file for this."""
+    if inc and not inc.get('no_incidents') and inc.get('title'):
         inc['id'] = hashlib.sha1(f"{inc['date']}|{inc['title']}".encode()).hexdigest()[:6]
     return inc
 
@@ -439,8 +446,7 @@ def format_status(incidents: List[Dict]) -> str:
             lines.append('No incidents reported.')
         else:
             if not inc.get('id'):
-                inc['id'] = secrets.token_hex(3)
-            lines.append(f"ID: {inc['id']}")
+                inc['id'] = hashlib.sha1(f"{inc['date']}|{inc.get('title','')}".encode()).hexdigest()[:6]
             lines.append(f"{inc.get('type','INCIDENT')}: {inc.get('title','Untitled')}")
             lines.append(f"SEVERITY: {inc.get('severity','medium')}")
             lines.append(f"COMPONENTS: {inc.get('components','')}")
@@ -931,7 +937,6 @@ class ComponentsSelectView(discord.ui.View):
         )
 
         async def status_callback(inter: discord.Interaction):
-            self.incident['id'] = secrets.token_hex(3)
             self.incident['updates'].append({
                 'timestamp': now_ts_str(),
                 'status': status_select.values[0],
