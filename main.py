@@ -81,7 +81,6 @@ SEVERITY_EMOJIS = {
     'low': '🟢',
     'medium': '🟡',
     'high': '🟠',
-    'critical': '🔴'
 }
 
 COMPONENT_OPTIONS = [
@@ -108,7 +107,6 @@ SEVERITY_SELECT_OPTIONS = [
     discord.SelectOption(label="Low",      value="low",      emoji="🟢"),
     discord.SelectOption(label="Medium",   value="medium",   emoji="🟡"),
     discord.SelectOption(label="High",     value="high",     emoji="🟠"),
-    discord.SelectOption(label="Critical", value="critical", emoji="🔴"),
 ]
 
 # ─── Date helpers (portable - avoids %-d which breaks on Windows) ────────────
