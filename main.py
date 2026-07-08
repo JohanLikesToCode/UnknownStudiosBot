@@ -253,35 +253,36 @@ async def load_data_store():
         channel = bot.get_channel(DATA_CHANNEL_ID) or await bot.fetch_channel(DATA_CHANNEL_ID)
     except Exception as e:
         print(f"ERROR: Cannot access data channel {DATA_CHANNEL_ID}: {type(e).__name__}: {e}")
-        print("Check the bot has 'View Channel' and 'Read Message History' permissions there.")
         bot._data_message = None
         bot._webhook_ids = {}
         return
 
     try:
         msg = await channel.fetch_message(DATA_MESSAGE_ID)
-    except Exception as e:
-        print(f"WARNING: Data message {DATA_MESSAGE_ID} not found ({type(e).__name__}: {e}); creating a new one.")
+        bot._data_message = msg
+        match = _DATA_JSON_RE.search(msg.content or "")
+        try:
+            bot._webhook_ids = json.loads(match.group(1)) if match else {}
+        except Exception:
+            bot._webhook_ids = {}
+        print(f"Loaded {len(bot._webhook_ids)} tracked webhook message id(s) from data message {msg.id}")
+        # ADD DEBUG LOGGING
+        if bot._webhook_ids:
+            print(f"DEBUG: Webhook IDs loaded: {json.dumps(bot._webhook_ids, indent=2)}")
+    except discord.NotFound:
+        print(f"WARNING: Data message {DATA_MESSAGE_ID} not found; creating a new one.")
         try:
             msg = await channel.send(
                 "📊 **Status Bot Data Store** — internal use only, do not delete or edit manually.\n"
                 "```json\n{}\n```"
             )
-            print(f"NEW DATA MESSAGE ID: {msg.id} — set the DATA_MESSAGE_ID env var to this "
-                  f"value so it persists across restarts.")
+            bot._data_message = msg
+            bot._webhook_ids = {}
+            print(f"NEW DATA MESSAGE ID: {msg.id} — set the DATA_MESSAGE_ID env var to this value!")
         except Exception as e2:
             print(f"Could not create a data message either: {e2}")
             bot._data_message = None
             bot._webhook_ids = {}
-            return
-
-    bot._data_message = msg
-    match = _DATA_JSON_RE.search(msg.content or "")
-    try:
-        bot._webhook_ids = json.loads(match.group(1)) if match else {}
-    except Exception:
-        bot._webhook_ids = {}
-    print(f"Loaded {len(bot._webhook_ids)} tracked webhook message id(s) from data message {msg.id}")
 
 async def save_webhook_ids(ids: dict) -> bool:
     bot._webhook_ids = ids
@@ -563,24 +564,13 @@ async def delete_webhook_message(msg_id: str):
         await session.delete(f"{STATUS_WEBHOOK}/messages/{msg_id}")
 
 async def sync_webhooks(incidents: List[Dict]):
-    """Sync webhook messages - update existing ones, only create if truly new.
-    Tracking is keyed by stable incident ID and, critically, is PERMANENT:
-    once an incident has a webhook message, later syncs always PATCH that
-    same message (including its final resolved state) instead of dropping
-    it from tracking. Dropping resolved incidents from tracking was the bug
-    that caused every resolved incident to be re-posted as a duplicate on
-    every subsequent sync. Tracking is only removed when an incident is
-    actually deleted from status.txt via the editor.
-
-    Incidents older than RECENT_SYNC_DAYS that are already resolved and were
-    never tracked (i.e. predate this bot / this tracking system) are left
-    alone entirely - we don't want a routine sync suddenly posting fresh
-    copies of year-old history into the channel.
-    """
+    """Sync webhook messages - update existing ones, only create if truly new."""
     ids = dict(bot._webhook_ids)
     new_ids = dict(ids)
     cutoff = datetime.now() - timedelta(days=RECENT_SYNC_DAYS)
-
+    
+    print(f"DEBUG: Starting sync with {len(ids)} tracked IDs: {list(ids.keys())}")
+    
     for inc in incidents:
         if inc.get('no_incidents') or not inc.get('title') or not inc.get('id'):
             continue
@@ -593,35 +583,45 @@ async def sync_webhooks(incidents: List[Dict]):
         is_resolved = updates[-1].get('status', '').upper() in ('RESOLVED', 'COMPLETED')
 
         if existing_id:
+            # Check if this is a recent restart - add a small delay
             success = await update_webhook_message(existing_id, inc)
             if success:
                 print(f"Updated existing message {existing_id} for incident {key}")
             else:
-                # Original message was deleted out-of-band; recreate it.
-                new_id = await create_webhook_message(inc)
-                if new_id:
-                    new_ids[key] = new_id
-                    print(f"Recreated message {new_id} for incident {key} (original was deleted)")
+                # IMPORTANT: Don't immediately recreate! Log the error and skip
+                print(f"WARNING: Failed to update message {existing_id} for incident {key} - keeping ID but skipping recreation")
+                # Keep the old ID to prevent duplicates
+                # Only recreate if we're SURE it was deleted
+                new_ids[key] = existing_id  # Keep old ID
         else:
             if is_resolved:
                 inc_date = _parse_incident_date(inc['date'])
                 if inc_date and inc_date < cutoff:
-                    # Old history that predates tracking - leave it alone.
                     continue
+            # Only create new messages if we're really sure it's new
+            print(f"Creating new message for incident {key} (not tracked)")
             new_id = await create_webhook_message(inc)
             if new_id:
                 new_ids[key] = new_id
                 print(f"Created new message {new_id} for incident {key}")
 
+    # Don't remove resolved incidents from tracking!
+    # Only remove if they're completely gone from status.txt
     current_ids = {inc['id'] for inc in incidents if inc.get('id') and not inc.get('no_incidents')}
     for key in list(new_ids.keys()):
         if key not in current_ids:
-            print(f"Dropped tracking for incident removed from status.txt: {key}")
+            print(f"Incident {key} removed from status.txt - deleting webhook message")
+            # Optionally delete the webhook message
+            if key in ids:
+                try:
+                    await delete_webhook_message(ids[key])
+                except Exception as e:
+                    print(f"Failed to delete webhook message for {key}: {e}")
             del new_ids[key]
 
     await save_webhook_ids(new_ids)
     print(f"Tracking {len(new_ids)} webhook message(s)")
-
+    
 # ─── Background Poller ────────────────────────────────────────────────────────
 @tasks.loop(seconds=POLL_INTERVAL)
 async def poll_status():
